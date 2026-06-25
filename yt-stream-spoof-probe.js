@@ -1,8 +1,8 @@
+yt-stream-spoof-probe.js text/javascript
 // yt-stream-spoof-probe.js
-// Dev-only Chroma user script.
-// Match: *://www.youtube.com/*
-// Run at: document_start
-// World: MAIN
+// Dev-only Chroma user scriptlet resource.
+// Add rule:
+// www.youtube.com##+js(yt-stream-spoof-probe)
 
 (() => {
   const g = globalThis;
@@ -17,7 +17,7 @@
 
   const CONFIG = {
     enabled: true,
-    replace: false, // keep false for v1
+    replace: false,
     timeoutMs: 2500,
     maxClients: 3,
   };
