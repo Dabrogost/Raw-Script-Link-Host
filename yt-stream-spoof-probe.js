@@ -12,14 +12,25 @@ yt-stream-spoof-probe.js text/javascript
   }
 
   const nativeFetch = g.fetch;
+  const nativeXHROpen = XMLHttpRequest.prototype.open;
+  const nativeXHRSend = XMLHttpRequest.prototype.send;
+
   const INTERNAL_HEADER = "X-Chroma-Stream-Probe";
+  const STORAGE_KEY = "__chroma_yt_stream_spoof_probe_logs__";
+
   const logs = [];
+
+  try {
+    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]");
+    if (Array.isArray(saved)) logs.push(...saved.slice(-50));
+  } catch {}
 
   const CONFIG = {
     enabled: true,
     replace: false,
     timeoutMs: 2500,
     maxClients: 3,
+    persist: true,
   };
 
   const CLIENTS = [
@@ -63,6 +74,20 @@ yt-stream-spoof-probe.js text/javascript
     console.warn("[chroma-stream-probe]", ...args);
   }
 
+  function saveLogs() {
+    if (!CONFIG.persist) return;
+
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(logs.slice(-50)));
+    } catch {}
+  }
+
+  function pushLog(record) {
+    logs.push(record);
+    while (logs.length > 50) logs.shift();
+    saveLogs();
+  }
+
   function getUrl(input) {
     if (typeof input === "string") return input;
     if (input instanceof URL) return input.href;
@@ -91,13 +116,44 @@ yt-stream-spoof-probe.js text/javascript
     }
   }
 
-  async function readRequestJson(input, init) {
+  function parseJsonMaybe(value) {
     try {
-      if (typeof init?.body === "string") return JSON.parse(init.body);
+      if (typeof value !== "string" || !value.trim()) return null;
+      return JSON.parse(value);
+    } catch {
+      return null;
+    }
+  }
+
+  async function readFetchRequestJson(input, init) {
+    try {
+      if (typeof init?.body === "string") return parseJsonMaybe(init.body);
 
       if (input instanceof Request) {
         const text = await input.clone().text();
-        return text ? JSON.parse(text) : null;
+        return parseJsonMaybe(text);
+      }
+    } catch {}
+
+    return null;
+  }
+
+  function readXHRResponseJson(xhr) {
+    try {
+      if (xhr.responseType && xhr.responseType !== "text" && xhr.responseType !== "json") {
+        return null;
+      }
+
+      if (xhr.responseType === "json" && xhr.response && typeof xhr.response === "object") {
+        return xhr.response;
+      }
+
+      if (typeof xhr.responseText === "string") {
+        return parseJsonMaybe(xhr.responseText);
+      }
+
+      if (typeof xhr.response === "string") {
+        return parseJsonMaybe(xhr.response);
       }
     } catch {}
 
@@ -291,38 +347,25 @@ yt-stream-spoof-probe.js text/javascript
     return results;
   }
 
-  g.fetch = async function chromaStreamProbeFetch(input, init) {
-    const url = getUrl(input);
+  async function handlePlayerResponse({ seenVia, url, originalBody, playerResponse }) {
+    if (!CONFIG.enabled) return;
 
-    if (
-      !CONFIG.enabled ||
-      hasInternalHeader(input, init) ||
-      !isPlayerUrl(url)
-    ) {
-      return nativeFetch.apply(this, arguments);
-    }
-
-    const originalBody = await readRequestJson(input, init);
     const videoId = getVideoId(originalBody);
-
-    const response = await nativeFetch.apply(this, arguments);
-
-    if (!videoId) return response;
+    if (!videoId) return;
 
     try {
-      const json = await response.clone().json();
-      const normal = summarize(json);
-
+      const normal = summarize(playerResponse);
       const results = await probeAll(url, originalBody, videoId);
 
       const record = {
         time: new Date().toLocaleTimeString(),
+        seenVia,
         videoId,
         normal,
         results,
       };
 
-      logs.push(record);
+      pushLog(record);
 
       log("probe result", record);
 
@@ -331,6 +374,7 @@ yt-stream-spoof-probe.js text/javascript
         ok: r.ok,
         nonSabr: r.nonSabr,
         reason: r.reason,
+        error: r.error,
         status: r.summary?.status,
         formats: r.summary?.formats,
         adaptiveFormats: r.summary?.adaptiveFormats,
@@ -343,8 +387,77 @@ yt-stream-spoof-probe.js text/javascript
     } catch (err) {
       warn("probe failed", err);
     }
+  }
+
+  g.fetch = async function chromaStreamProbeFetch(input, init) {
+    const url = getUrl(input);
+
+    if (
+      !CONFIG.enabled ||
+      hasInternalHeader(input, init) ||
+      !isPlayerUrl(url)
+    ) {
+      return nativeFetch.apply(this, arguments);
+    }
+
+    const originalBody = await readFetchRequestJson(input, init);
+    const response = await nativeFetch.apply(this, arguments);
+
+    try {
+      const json = await response.clone().json();
+      handlePlayerResponse({
+        seenVia: "fetch",
+        url,
+        originalBody,
+        playerResponse: json,
+      });
+    } catch {}
 
     return response;
+  };
+
+  XMLHttpRequest.prototype.open = function chromaStreamProbeOpen(method, url) {
+    try {
+      this.__chromaStreamProbe = {
+        method: String(method || "GET"),
+        url: String(url || ""),
+        body: null,
+        handled: false,
+      };
+    } catch {}
+
+    return nativeXHROpen.apply(this, arguments);
+  };
+
+  XMLHttpRequest.prototype.send = function chromaStreamProbeSend(body) {
+    try {
+      const meta = this.__chromaStreamProbe;
+
+      if (
+        CONFIG.enabled &&
+        meta &&
+        isPlayerUrl(meta.url)
+      ) {
+        meta.body = typeof body === "string" ? parseJsonMaybe(body) : null;
+
+        this.addEventListener("readystatechange", () => {
+          if (this.readyState !== 4 || meta.handled) return;
+          meta.handled = true;
+
+          const json = readXHRResponseJson(this);
+          if (!json) return;
+
+          handlePlayerResponse({
+            seenVia: "xhr",
+            url: meta.url,
+            originalBody: meta.body,
+            playerResponse: json,
+          });
+        });
+      }
+    } catch {}
+
+    return nativeXHRSend.apply(this, arguments);
   };
 
   g.__CHROMA_YT_STREAM_SPOOF_PROBE__ = {
@@ -361,11 +474,35 @@ yt-stream-spoof-probe.js text/javascript
       log("disabled");
     },
 
+    clear() {
+      logs.length = 0;
+      try {
+        localStorage.removeItem(STORAGE_KEY);
+      } catch {}
+      log("logs cleared");
+    },
+
+    copy() {
+      const text = JSON.stringify(logs, null, 2);
+      try {
+        copy(text);
+        log(`copied ${logs.length} log(s)`);
+      } catch {
+        console.log(text);
+      }
+    },
+
+    latest() {
+      return logs[logs.length - 1] || null;
+    },
+
     stop() {
       g.fetch = nativeFetch;
+      XMLHttpRequest.prototype.open = nativeXHROpen;
+      XMLHttpRequest.prototype.send = nativeXHRSend;
       log("stopped");
     },
   };
 
-  log("installed. Click a fresh video. Inspect with __CHROMA_YT_STREAM_SPOOF_PROBE__.logs");
+  log("installed with fetch + XHR hooks. Click a fresh video. Inspect with __CHROMA_YT_STREAM_SPOOF_PROBE__.logs");
 })();
