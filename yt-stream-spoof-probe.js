@@ -1,7 +1,7 @@
 yt-stream-spoof-probe.js text/javascript
 // yt-stream-spoof-probe.js
 // Dev-only Chroma user scriptlet resource.
-// Add rule:
+// Rule:
 // www.youtube.com##+js(yt-stream-spoof-probe)
 
 (() => {
@@ -12,13 +12,8 @@ yt-stream-spoof-probe.js text/javascript
   }
 
   const nativeFetch = g.fetch;
-  const nativeXHROpen = XMLHttpRequest.prototype.open;
-  const nativeXHRSend = XMLHttpRequest.prototype.send;
-
-  const INTERNAL_HEADER = "X-Chroma-Stream-Probe";
-  const STORAGE_KEY = "__chroma_yt_stream_spoof_probe_logs__";
-
   const logs = [];
+  const STORAGE_KEY = "__chroma_yt_stream_spoof_probe_logs__";
 
   try {
     const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]");
@@ -27,10 +22,10 @@ yt-stream-spoof-probe.js text/javascript
 
   const CONFIG = {
     enabled: true,
-    replace: false,
-    timeoutMs: 2500,
+    timeoutMs: 3500,
     maxClients: 3,
-    persist: true,
+    autoProbe: true,
+    debounceMs: 750,
   };
 
   const CLIENTS = [
@@ -66,6 +61,9 @@ yt-stream-spoof-probe.js text/javascript
     },
   ];
 
+  let timer = null;
+  let lastProbeKey = "";
+
   function log(...args) {
     console.log("%c[chroma-stream-probe]", "font-weight:bold;color:#7a4cff", ...args);
   }
@@ -75,8 +73,6 @@ yt-stream-spoof-probe.js text/javascript
   }
 
   function saveLogs() {
-    if (!CONFIG.persist) return;
-
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(logs.slice(-50)));
     } catch {}
@@ -88,80 +84,19 @@ yt-stream-spoof-probe.js text/javascript
     saveLogs();
   }
 
-  function getUrl(input) {
-    if (typeof input === "string") return input;
-    if (input instanceof URL) return input.href;
-    if (input?.url) return input.url;
-    return "";
-  }
-
-  function isPlayerUrl(url) {
+  function getCurrentVideoId() {
     try {
-      const u = new URL(String(url), location.href);
-      return (
-        u.hostname.endsWith("youtube.com") &&
-        u.pathname.includes("/youtubei/v1/player")
-      );
-    } catch {
-      return false;
-    }
-  }
+      const url = new URL(location.href);
+      const v = url.searchParams.get("v");
+      if (v) return v;
+    } catch {}
 
-  function hasInternalHeader(input, init) {
     try {
-      const headers = new Headers(init?.headers || input?.headers || undefined);
-      return headers.has(INTERNAL_HEADER);
-    } catch {
-      return false;
-    }
-  }
-
-  function parseJsonMaybe(value) {
-    try {
-      if (typeof value !== "string" || !value.trim()) return null;
-      return JSON.parse(value);
-    } catch {
-      return null;
-    }
-  }
-
-  async function readFetchRequestJson(input, init) {
-    try {
-      if (typeof init?.body === "string") return parseJsonMaybe(init.body);
-
-      if (input instanceof Request) {
-        const text = await input.clone().text();
-        return parseJsonMaybe(text);
-      }
+      const player = document.querySelector("ytd-watch-flexy")?.getAttribute("video-id");
+      if (player) return player;
     } catch {}
 
     return null;
-  }
-
-  function readXHRResponseJson(xhr) {
-    try {
-      if (xhr.responseType && xhr.responseType !== "text" && xhr.responseType !== "json") {
-        return null;
-      }
-
-      if (xhr.responseType === "json" && xhr.response && typeof xhr.response === "object") {
-        return xhr.response;
-      }
-
-      if (typeof xhr.responseText === "string") {
-        return parseJsonMaybe(xhr.responseText);
-      }
-
-      if (typeof xhr.response === "string") {
-        return parseJsonMaybe(xhr.response);
-      }
-    } catch {}
-
-    return null;
-  }
-
-  function getVideoId(body) {
-    return body?.videoId || body?.playerRequest?.videoId || null;
   }
 
   function collectStrings(value, out = []) {
@@ -214,6 +149,8 @@ yt-stream-spoof-probe.js text/javascript
 
     return {
       status: playerResponse?.playabilityStatus?.status || "",
+      reason: playerResponse?.playabilityStatus?.reason || "",
+      playableInEmbed: playerResponse?.playabilityStatus?.playableInEmbed ?? null,
       formats: formats.length,
       adaptiveFormats: adaptive.length,
       hasServerAbr: typeof sd.serverAbrStreamingUrl === "string",
@@ -221,18 +158,16 @@ yt-stream-spoof-probe.js text/javascript
       hasAudio: all.some(f => String(f.mimeType || "").includes("audio")),
       hasVideo: all.some(f => String(f.mimeType || "").includes("video")),
       maxHeight: Math.max(0, ...all.map(f => Number(f.height || 0))),
-      itags: all.map(f => f.itag).filter(Boolean).slice(0, 16),
+      itags: all.map(f => f.itag).filter(Boolean).slice(0, 20),
     };
   }
 
-  function makeSpoofBody(client, originalBody, videoId) {
-    const originalClient = originalBody?.context?.client || {};
-
+  function makeSpoofBody(client, videoId) {
     const clientObj = {
       clientName: client.clientName,
       clientVersion: client.clientVersion,
-      hl: originalClient.hl || "en",
-      gl: originalClient.gl || "US",
+      hl: "en",
+      gl: "US",
     };
 
     if (client.platform) clientObj.platform = client.platform;
@@ -267,22 +202,20 @@ yt-stream-spoof-probe.js text/javascript
     return body;
   }
 
-  async function probeClient(url, client, originalBody, videoId) {
+  async function probeClient(client, videoId) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), CONFIG.timeoutMs);
 
     try {
-      const headers = new Headers();
-      headers.set("Content-Type", "application/json");
-      headers.set("X-YouTube-Client-Name", client.clientName);
-      headers.set("X-YouTube-Client-Version", client.clientVersion);
-      headers.set(INTERNAL_HEADER, "1");
-
-      const res = await nativeFetch(url, {
+      const res = await nativeFetch("/youtubei/v1/player?prettyPrint=false", {
         method: "POST",
         credentials: "same-origin",
-        headers,
-        body: JSON.stringify(makeSpoofBody(client, originalBody, videoId)),
+        headers: {
+          "Content-Type": "application/json",
+          "X-YouTube-Client-Name": client.clientName,
+          "X-YouTube-Client-Version": client.clientVersion,
+        },
+        body: JSON.stringify(makeSpoofBody(client, videoId)),
         signal: controller.signal,
       });
 
@@ -334,144 +267,109 @@ yt-stream-spoof-probe.js text/javascript
     }
   }
 
-  async function probeAll(url, originalBody, videoId) {
+  async function probeNow(reason = "manual") {
+    if (!CONFIG.enabled) return null;
+
+    const videoId = getCurrentVideoId();
+
+    if (!videoId) {
+      warn("no current video id");
+      return null;
+    }
+
+    const probeKey = `${videoId}:${reason}:${Date.now()}`;
+    lastProbeKey = probeKey;
+
+    log("probing current video", { videoId, reason });
+
     const results = [];
 
     for (const client of CLIENTS.slice(0, CONFIG.maxClients)) {
-      const result = await probeClient(url, client, originalBody, videoId);
+      const result = await probeClient(client, videoId);
       results.push(result);
 
       if (result.ok && result.nonSabr) break;
     }
 
-    return results;
+    const record = {
+      time: new Date().toLocaleTimeString(),
+      reason,
+      videoId,
+      results,
+    };
+
+    pushLog(record);
+
+    log("probe result", record);
+
+    console.table(results.map(r => ({
+      client: r.client,
+      ok: r.ok,
+      nonSabr: r.nonSabr,
+      reason: r.reason,
+      error: r.error,
+      status: r.summary?.status,
+      formats: r.summary?.formats,
+      adaptiveFormats: r.summary?.adaptiveFormats,
+      hasSabr: r.summary?.hasSabr,
+      hasServerAbr: r.summary?.hasServerAbr,
+      hasAudio: r.summary?.hasAudio,
+      hasVideo: r.summary?.hasVideo,
+      maxHeight: r.summary?.maxHeight,
+      itags: r.summary?.itags?.join(","),
+    })));
+
+    return record;
   }
 
-  async function handlePlayerResponse({ seenVia, url, originalBody, playerResponse }) {
-    if (!CONFIG.enabled) return;
+  function scheduleProbe(reason) {
+    if (!CONFIG.autoProbe) return;
 
-    const videoId = getVideoId(originalBody);
-    if (!videoId) return;
+    clearTimeout(timer);
 
-    try {
-      const normal = summarize(playerResponse);
-      const results = await probeAll(url, originalBody, videoId);
+    timer = setTimeout(() => {
+      const videoId = getCurrentVideoId();
+      if (!videoId) return;
 
-      const record = {
-        time: new Date().toLocaleTimeString(),
-        seenVia,
-        videoId,
-        normal,
-        results,
-      };
+      const key = `${videoId}:${reason}`;
+      if (lastProbeKey.startsWith(`${videoId}:`)) return;
 
-      pushLog(record);
-
-      log("probe result", record);
-
-      console.table(results.map(r => ({
-        client: r.client,
-        ok: r.ok,
-        nonSabr: r.nonSabr,
-        reason: r.reason,
-        error: r.error,
-        status: r.summary?.status,
-        formats: r.summary?.formats,
-        adaptiveFormats: r.summary?.adaptiveFormats,
-        hasSabr: r.summary?.hasSabr,
-        hasServerAbr: r.summary?.hasServerAbr,
-        hasAudio: r.summary?.hasAudio,
-        hasVideo: r.summary?.hasVideo,
-        maxHeight: r.summary?.maxHeight,
-      })));
-    } catch (err) {
-      warn("probe failed", err);
-    }
+      probeNow(reason);
+    }, CONFIG.debounceMs);
   }
 
-  g.fetch = async function chromaStreamProbeFetch(input, init) {
-    const url = getUrl(input);
+  function onNavigate() {
+    lastProbeKey = "";
+    scheduleProbe("navigate");
+  }
 
-    if (
-      !CONFIG.enabled ||
-      hasInternalHeader(input, init) ||
-      !isPlayerUrl(url)
-    ) {
-      return nativeFetch.apply(this, arguments);
-    }
+  document.addEventListener("yt-navigate-finish", onNavigate, true);
+  document.addEventListener("yt-page-data-updated", onNavigate, true);
+  window.addEventListener("popstate", onNavigate, true);
 
-    const originalBody = await readFetchRequestJson(input, init);
-    const response = await nativeFetch.apply(this, arguments);
+  const originalPushState = history.pushState;
+  const originalReplaceState = history.replaceState;
 
-    try {
-      const json = await response.clone().json();
-      handlePlayerResponse({
-        seenVia: "fetch",
-        url,
-        originalBody,
-        playerResponse: json,
-      });
-    } catch {}
-
-    return response;
+  history.pushState = function patchedPushState() {
+    const result = originalPushState.apply(this, arguments);
+    onNavigate();
+    return result;
   };
 
-  XMLHttpRequest.prototype.open = function chromaStreamProbeOpen(method, url) {
-    try {
-      this.__chromaStreamProbe = {
-        method: String(method || "GET"),
-        url: String(url || ""),
-        body: null,
-        handled: false,
-      };
-    } catch {}
-
-    return nativeXHROpen.apply(this, arguments);
-  };
-
-  XMLHttpRequest.prototype.send = function chromaStreamProbeSend(body) {
-    try {
-      const meta = this.__chromaStreamProbe;
-
-      if (
-        CONFIG.enabled &&
-        meta &&
-        isPlayerUrl(meta.url)
-      ) {
-        meta.body = typeof body === "string" ? parseJsonMaybe(body) : null;
-
-        this.addEventListener("readystatechange", () => {
-          if (this.readyState !== 4 || meta.handled) return;
-          meta.handled = true;
-
-          const json = readXHRResponseJson(this);
-          if (!json) return;
-
-          handlePlayerResponse({
-            seenVia: "xhr",
-            url: meta.url,
-            originalBody: meta.body,
-            playerResponse: json,
-          });
-        });
-      }
-    } catch {}
-
-    return nativeXHRSend.apply(this, arguments);
+  history.replaceState = function patchedReplaceState() {
+    const result = originalReplaceState.apply(this, arguments);
+    onNavigate();
+    return result;
   };
 
   g.__CHROMA_YT_STREAM_SPOOF_PROBE__ = {
     config: CONFIG,
     logs,
 
-    enable() {
-      CONFIG.enabled = true;
-      log("enabled");
-    },
+    probeNow,
 
-    disable() {
-      CONFIG.enabled = false;
-      log("disabled");
+    latest() {
+      return logs[logs.length - 1] || null;
     },
 
     clear() {
@@ -492,17 +390,17 @@ yt-stream-spoof-probe.js text/javascript
       }
     },
 
-    latest() {
-      return logs[logs.length - 1] || null;
-    },
-
     stop() {
-      g.fetch = nativeFetch;
-      XMLHttpRequest.prototype.open = nativeXHROpen;
-      XMLHttpRequest.prototype.send = nativeXHRSend;
+      clearTimeout(timer);
+      document.removeEventListener("yt-navigate-finish", onNavigate, true);
+      document.removeEventListener("yt-page-data-updated", onNavigate, true);
+      window.removeEventListener("popstate", onNavigate, true);
+      history.pushState = originalPushState;
+      history.replaceState = originalReplaceState;
       log("stopped");
     },
   };
 
-  log("installed with fetch + XHR hooks. Click a fresh video. Inspect with __CHROMA_YT_STREAM_SPOOF_PROBE__.logs");
+  log("installed active-probe version. Use __CHROMA_YT_STREAM_SPOOF_PROBE__.probeNow()");
+  scheduleProbe("install");
 })();
