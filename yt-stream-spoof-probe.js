@@ -1,4 +1,4 @@
-// yt-stream-spoof-probe.user.js
+// yt-stream-spoof-probe.js
 // Dev-only Chroma user script.
 // Match: *://www.youtube.com/*
 // Run at: document_start
