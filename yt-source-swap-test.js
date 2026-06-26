@@ -15,16 +15,22 @@ yt-source-swap-test.js text/javascript
   const decoder = new TextDecoder("utf-8");
 
   const events = [];
-  const maxEvents = 200;
+  const maxEvents = 250;
 
   const config = {
     enabled: true,
     targetVersion: "1.20160315",
     requireNonSabr: true,
+    requireStreamingDataProof: true,
     logVerbose: true,
     logIgnoredYoutubei: true,
     interceptFetch: true,
     interceptXhr: true,
+    endpoints: {
+      player: true,
+      getWatch: true,
+      next: true,
+    },
   };
 
   const counters = {
@@ -35,15 +41,22 @@ yt-source-swap-test.js text/javascript
     attempts: 0,
     attemptsFetch: 0,
     attemptsXhr: 0,
+    attemptsPlayer: 0,
+    attemptsGetWatch: 0,
+    attemptsNext: 0,
     success: 0,
     successFetch: 0,
     successXhr: 0,
+    successPlayer: 0,
+    successGetWatch: 0,
+    successNext: 0,
     fallback: 0,
     errors: 0,
     syntheticXhr: 0,
     lastVideoId: "",
     lastReason: "",
     lastTransport: "",
+    lastEndpoint: "",
   };
 
   function log(...args) {
@@ -67,21 +80,25 @@ yt-source-swap-test.js text/javascript
     }
   }
 
-  function isYoutubeiUrl(url) {
-    return String(url || "").includes("/youtubei/");
-  }
+  function endpointForUrl(url) {
+    const s = String(url || "");
 
-  function isPlayerUrl(url) {
-    return String(url || "").includes("/youtubei/v1/player");
+    if (s.includes("/youtubei/v1/player")) return "player";
+    if (s.includes("/youtubei/v1/get_watch")) return "get_watch";
+    if (s.includes("/youtubei/v1/next")) return "next";
+
+    return "";
   }
 
   function isUsefulYoutubeiUrl(url) {
-    const s = String(url || "");
-    return (
-      s.includes("/youtubei/v1/player") ||
-      s.includes("/youtubei/v1/get_watch") ||
-      s.includes("/youtubei/v1/next")
-    );
+    return !!endpointForUrl(url);
+  }
+
+  function isEndpointEnabled(endpoint) {
+    if (endpoint === "player") return !!config.endpoints.player;
+    if (endpoint === "get_watch") return !!config.endpoints.getWatch;
+    if (endpoint === "next") return !!config.endpoints.next;
+    return false;
   }
 
   function safeJson(text) {
@@ -295,6 +312,7 @@ yt-source-swap-test.js text/javascript
 
     return {
       transport: "fetch",
+      endpoint: endpointForUrl(url),
       url,
       method,
       rawHeaders,
@@ -312,6 +330,7 @@ yt-source-swap-test.js text/javascript
 
     return {
       transport: "xhr",
+      endpoint: endpointForUrl(meta.url || ""),
       url: meta.url || "",
       method: meta.method || "GET",
       rawHeaders: meta.rawHeaders || {},
@@ -364,6 +383,84 @@ yt-source-swap-test.js text/javascript
     };
   }
 
+  function playerSummaryIsUsable(summary) {
+    if (!summary) return false;
+    if (summary.status !== "OK") return false;
+    if (!summary.hasStreamingData) return false;
+    if (config.requireNonSabr && summary.hasSabr) return false;
+    return true;
+  }
+
+  function findPlayerLikeObjects(root) {
+    const found = [];
+    const seen = new WeakSet();
+    let visited = 0;
+    const maxVisited = 6000;
+    const maxDepth = 12;
+
+    function tryJsonString(value) {
+      if (typeof value !== "string") return null;
+      const t = value.trim();
+      if (!t || t[0] !== "{") return null;
+      if (!t.includes("streamingData") && !t.includes("playabilityStatus")) return null;
+      return safeJson(t);
+    }
+
+    function walk(value, path, depth) {
+      if (found.length >= 20) return;
+      if (visited++ > maxVisited) return;
+      if (depth > maxDepth) return;
+
+      const parsed = tryJsonString(value);
+      if (parsed) {
+        walk(parsed, `${path}<json>`, depth + 1);
+        return;
+      }
+
+      if (!value || typeof value !== "object") return;
+      if (seen.has(value)) return;
+      seen.add(value);
+
+      if (value.playabilityStatus && value.streamingData) {
+        found.push({
+          path: path || "$",
+          summary: summarizePlayerResponse(value),
+        });
+      }
+
+      if (Array.isArray(value)) {
+        for (let i = 0; i < value.length; i++) {
+          walk(value[i], `${path}[${i}]`, depth + 1);
+        }
+        return;
+      }
+
+      for (const [key, child] of Object.entries(value)) {
+        walk(child, path ? `${path}.${key}` : key, depth + 1);
+      }
+    }
+
+    walk(root, "", 0);
+    return found;
+  }
+
+  function summarizeEndpointResponse(json) {
+    const direct = summarizePlayerResponse(json);
+    const nestedPlayers = findPlayerLikeObjects(json);
+    const bestNested = nestedPlayers.find(p => playerSummaryIsUsable(p.summary)) || nestedPlayers[0] || null;
+    const directUsable = playerSummaryIsUsable(direct);
+
+    return {
+      direct,
+      directUsable,
+      nestedPlayerCount: nestedPlayers.length,
+      nestedPlayers: nestedPlayers.slice(0, 8),
+      bestNested,
+      bestUsable: directUsable || !!nestedPlayers.find(p => playerSummaryIsUsable(p.summary)),
+      topKeys: json ? Object.keys(json).slice(0, 80) : [],
+    };
+  }
+
   function makeReplacementResponse(json) {
     return new Response(JSON.stringify(json), {
       status: 200,
@@ -377,7 +474,10 @@ yt-source-swap-test.js text/javascript
 
   function shouldAttemptSwap(meta) {
     if (!config.enabled) return [false, "disabled"];
-    if (!isPlayerUrl(meta.url)) return [false, "not-player"];
+
+    const endpoint = endpointForUrl(meta.url);
+    if (!endpoint) return [false, "not-target-endpoint"];
+    if (!isEndpointEnabled(endpoint)) return [false, `endpoint-disabled-${endpoint}`];
     if (String(meta.method).toUpperCase() !== "POST") return [false, "not-post"];
     if (!meta.bodyJson) return [false, "no-json-body"];
 
@@ -386,7 +486,10 @@ yt-source-swap-test.js text/javascript
     if (!client) return [false, "no-client"];
     if (client.clientName !== "WEB") return [false, `client-${client.clientName || "missing"}`];
     if (client.clientVersion === config.targetVersion) return [false, "already-target-version"];
-    if (!meta.bodyJson.videoId) return [false, "no-video-id"];
+
+    if (endpoint === "player" && !meta.bodyJson.videoId) {
+      return [false, "no-video-id"];
+    }
 
     return [true, "ok"];
   }
@@ -398,6 +501,7 @@ yt-source-swap-test.js text/javascript
     remember({
       event: reason ? "ignored-youtubei" : "seen-youtubei",
       transport: meta.transport,
+      endpoint: meta.endpoint || endpointForUrl(meta.url),
       reason,
       url: meta.url,
       method: meta.method,
@@ -409,14 +513,15 @@ yt-source-swap-test.js text/javascript
       clientVersion: meta.bodyJson?.context?.client?.clientVersion || "",
       hasPlaybackContext: !!meta.bodyJson?.playbackContext,
       hasServiceIntegrity: !!meta.bodyJson?.serviceIntegrityDimensions,
+      topKeys: meta.bodyJson ? Object.keys(meta.bodyJson).slice(0, 40) : [],
     });
   }
 
-  async function fetchOldWebPlayer(meta) {
+  async function fetchOldWebEndpoint(meta) {
     const swappedBody = cloneJson(meta.bodyJson);
 
     if (!swappedBody?.context?.client) {
-      throw new Error("No context.client in player body");
+      throw new Error("No context.client in youtubei body");
     }
 
     swappedBody.context.client.clientName = "WEB";
@@ -452,34 +557,53 @@ yt-source-swap-test.js text/javascript
 
     const text = await resp.text();
     const json = safeJson(text);
-    const summary = summarizePlayerResponse(json);
+    const endpointSummary = summarizeEndpointResponse(json);
 
     return {
+      endpoint: meta.endpoint || endpointForUrl(meta.url),
       httpStatus: resp.status,
       ok: resp.ok,
       durationMs: Math.round(performance.now() - started),
       gzip,
       json,
       responseText: json ? JSON.stringify(json) : text,
-      summary,
+      summary: endpointSummary.direct,
+      endpointSummary,
       textPreview: json ? "" : text.slice(0, 500),
     };
   }
 
   function validReplacement(result) {
-    return (
-      result.ok &&
-      result.summary?.status === "OK" &&
-      result.summary?.hasStreamingData &&
-      (!config.requireNonSabr || !result.summary?.hasSabr)
-    );
+    if (!result.ok) return false;
+
+    if (!config.requireStreamingDataProof) {
+      return true;
+    }
+
+    return !!result.endpointSummary?.bestUsable;
+  }
+
+  function countAttemptEndpoint(endpoint) {
+    if (endpoint === "player") counters.attemptsPlayer++;
+    if (endpoint === "get_watch") counters.attemptsGetWatch++;
+    if (endpoint === "next") counters.attemptsNext++;
+  }
+
+  function countSuccessEndpoint(endpoint) {
+    if (endpoint === "player") counters.successPlayer++;
+    if (endpoint === "get_watch") counters.successGetWatch++;
+    if (endpoint === "next") counters.successNext++;
   }
 
   async function trySwap(meta) {
+    const endpoint = meta.endpoint || endpointForUrl(meta.url);
+
     counters.attempts++;
     counters.lastVideoId = meta.bodyJson?.videoId || "";
     counters.lastReason = "attempting";
     counters.lastTransport = meta.transport;
+    counters.lastEndpoint = endpoint;
+    countAttemptEndpoint(endpoint);
 
     if (meta.transport === "fetch") counters.attemptsFetch++;
     if (meta.transport === "xhr") counters.attemptsXhr++;
@@ -487,40 +611,53 @@ yt-source-swap-test.js text/javascript
     remember({
       event: "attempt",
       transport: meta.transport,
+      endpoint,
       videoId: meta.bodyJson?.videoId || "",
       originalClientName: meta.bodyJson?.context?.client?.clientName || "",
       originalClientVersion: meta.bodyJson?.context?.client?.clientVersion || "",
       targetVersion: config.targetVersion,
       bodyType: meta.bodyType,
       bodyTextLength: meta.bodyTextLength,
+      topKeys: meta.bodyJson ? Object.keys(meta.bodyJson).slice(0, 40) : [],
     });
 
-    const result = await fetchOldWebPlayer(meta);
+    const result = await fetchOldWebEndpoint(meta);
     const ok = validReplacement(result);
 
     remember({
       event: ok ? "replace" : "fallback",
       transport: meta.transport,
+      endpoint,
       videoId: meta.bodyJson?.videoId || "",
       httpStatus: result.httpStatus,
       durationMs: result.durationMs,
       gzip: result.gzip,
       summary: result.summary,
+      endpointSummary: {
+        directUsable: result.endpointSummary?.directUsable || false,
+        nestedPlayerCount: result.endpointSummary?.nestedPlayerCount || 0,
+        bestUsable: result.endpointSummary?.bestUsable || false,
+        bestNested: result.endpointSummary?.bestNested || null,
+        topKeys: result.endpointSummary?.topKeys || [],
+      },
       textPreview: result.textPreview,
     });
 
     if (ok) {
       counters.success++;
       counters.lastReason = "replaced";
+      countSuccessEndpoint(endpoint);
 
       if (meta.transport === "fetch") counters.successFetch++;
       if (meta.transport === "xhr") counters.successXhr++;
 
-      log("replacing /player response", {
+      log("replacing youtubei response", {
         transport: meta.transport,
+        endpoint,
         videoId: meta.bodyJson?.videoId || "",
         durationMs: result.durationMs,
         summary: result.summary,
+        endpointSummary: result.endpointSummary,
       });
 
       return result;
@@ -531,8 +668,10 @@ yt-source-swap-test.js text/javascript
 
     warn("replacement invalid; falling back", {
       transport: meta.transport,
+      endpoint,
       videoId: meta.bodyJson?.videoId || "",
       summary: result.summary,
+      endpointSummary: result.endpointSummary,
       textPreview: result.textPreview,
     });
 
@@ -552,6 +691,7 @@ yt-source-swap-test.js text/javascript
       counters.seen++;
       counters.seenFetch++;
       counters.lastTransport = "fetch";
+      counters.lastEndpoint = meta.endpoint || "";
 
       const [shouldAttempt, reason] = shouldAttemptSwap(meta);
 
@@ -577,6 +717,7 @@ yt-source-swap-test.js text/javascript
       remember({
         event: "error",
         transport: "fetch",
+        endpoint: meta?.endpoint || "",
         videoId: meta?.bodyJson?.videoId || "",
         error: counters.lastReason,
       });
@@ -711,6 +852,7 @@ yt-source-swap-test.js text/javascript
         counters.seen++;
         counters.seenXhr++;
         counters.lastTransport = "xhr";
+        counters.lastEndpoint = meta.endpoint || "";
 
         const [shouldAttempt, reason] = shouldAttemptSwap(meta);
 
@@ -738,6 +880,7 @@ yt-source-swap-test.js text/javascript
           remember({
             event: "error",
             transport: "xhr",
+            endpoint: meta?.endpoint || "",
             videoId: meta?.bodyJson?.videoId || "",
             error: counters.lastReason,
           });
@@ -773,7 +916,7 @@ yt-source-swap-test.js text/javascript
 
     stats() {
       return {
-        config: { ...config },
+        config: { ...config, endpoints: { ...config.endpoints } },
         counters: { ...counters },
         lastEvent: events[events.length - 1] || null,
       };
@@ -819,5 +962,5 @@ yt-source-swap-test.js text/javascript
     },
   };
 
-  console.log("[yt-source-swap] installed fetch+XHR version. Use __YT_SOURCE_SWAP_TEST__.stats()");
+  console.log("[yt-source-swap] installed player/get_watch/next version. Use __YT_SOURCE_SWAP_TEST__.stats()");
 })();
