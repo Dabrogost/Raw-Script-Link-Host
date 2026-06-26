@@ -267,6 +267,91 @@ yt-source-swap-test.js text/javascript
     );
   }
 
+  function isVisiblePatchedMweb360Source() {
+    const v = document.querySelector("video");
+    const src = String(v?.currentSrc || "");
+
+    if (!v || !src) return false;
+    if (!/googlevideo\.com\/videoplayback/i.test(src)) return false;
+
+    let url = null;
+
+    try {
+      url = new URL(src);
+    } catch {
+      return false;
+    }
+
+    const itag = url.searchParams.get("itag") || "";
+    const hasSabr =
+      url.searchParams.has("sabr") ||
+      /(?:[?&]|%26)sabr(?:=|%3D)1/i.test(src);
+
+    return itag === "18" && !hasSabr;
+  }
+
+  function scheduleFocusedPatchedPlaybackStart(videoId, reason = "patched-mweb-360-ready") {
+    const delays = [250, 750, 1500, 2500];
+
+    for (const delayMs of delays) {
+      setTimeout(() => {
+        const currentVideoId = getCurrentEffectiveVideoId();
+        if (videoId && currentVideoId && currentVideoId !== videoId) return;
+
+        const player = getMoviePlayer();
+        const v = document.querySelector("video");
+
+        const playerState =
+          player && typeof player.getPlayerState === "function"
+            ? player.getPlayerState()
+            : null;
+
+        const isPatchedMweb360 = isVisiblePatchedMweb360Source();
+
+        remember({
+          event: "patched-playback-start-check",
+          reason,
+          delayMs,
+          videoId,
+          currentVideoId,
+          playerState,
+          isPatchedMweb360,
+          videoState: summarizeVideoElementState(),
+        });
+
+        if (!player || typeof player.playVideo !== "function") return;
+        if (!v) return;
+        if (!v.paused) return;
+        if (v.error) return;
+        if (!isPatchedMweb360) return;
+
+        try {
+          player.playVideo();
+
+          remember({
+            event: "patched-playback-start-attempt",
+            reason,
+            delayMs,
+            videoId,
+            currentVideoId,
+            playerState,
+            videoState: summarizeVideoElementState(),
+          });
+        } catch (err) {
+          remember({
+            event: "patched-playback-start-failed",
+            reason,
+            delayMs,
+            videoId,
+            currentVideoId,
+            error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
+            videoState: summarizeVideoElementState(),
+          });
+        }
+      }, delayMs);
+    }
+  }
+
   function playerEndpointUrl() {
     return `${location.origin}/youtubei/v1/player?prettyPrint=false`;
   }
@@ -1381,7 +1466,7 @@ yt-source-swap-test.js text/javascript
     return record;
   }
 
-  function scheduleHybridStartupHandoff(videoId) {
+  function scheduleBackgroundWarmupReadyCheck(videoId) {
     if (!isHybridStartupMode()) return;
     if (!videoId) return;
     if (hybridState.handoffInProgress) return;
@@ -1392,7 +1477,7 @@ yt-source-swap-test.js text/javascript
     hybridState.activePatchVideoId = videoId;
 
     remember({
-      event: "hybrid-handoff-scheduled",
+      event: "background-warmup-ready-check-scheduled",
       videoId,
       handoffAtSeconds: config.hybridStartup.handoffAtSeconds,
       pageVideoId: getCurrentPageVideoId(),
@@ -1493,7 +1578,7 @@ yt-source-swap-test.js text/javascript
       }
 
       remember({
-        event: "hybrid-handoff-warmup-ready",
+        event: "background-warmup-ready",
         videoId,
         warmupAgeMs,
         warmupDurationMs: warmup.completedAt
@@ -2026,6 +2111,8 @@ yt-source-swap-test.js text/javascript
       acceptedBy: targetPlayer.acceptedBy || "",
     });
 
+    scheduleFocusedPatchedPlaybackStart(wantedVideoId || getCurrentEffectiveVideoId());
+
     lastPatch = {
       time: performance.now(),
       targetProfile: targetResult.targetProfile,
@@ -2080,7 +2167,7 @@ yt-source-swap-test.js text/javascript
       config.classicPatchMode === "mweb-progressive-auto" &&
       targetPlayer.acceptedBy === "progressiveAutoOk"
     ) {
-      scheduleHybridStartupHandoff(wantedVideoId || getCurrentEffectiveVideoId());
+      scheduleBackgroundWarmupReadyCheck(wantedVideoId || getCurrentEffectiveVideoId());
     }
 
     return makeJsonResponseFromOriginal(originalResp, originalJson);
