@@ -424,6 +424,7 @@ yt-source-swap-test.js text/javascript
       if (value.playabilityStatus && value.streamingData) {
         found.push({
           path: path || "$",
+          value,
           summary: summarizePlayerResponse(value),
         });
       }
@@ -444,19 +445,31 @@ yt-source-swap-test.js text/javascript
     return found;
   }
 
+  function findBestUsablePlayerObject(root) {
+    const matches = findPlayerLikeObjects(root);
+    return matches.find(p => playerSummaryIsUsable(p.summary)) || null;
+  }
+
+  function findFirstModernPlayerObject(root) {
+    const matches = findPlayerLikeObjects(root);
+    return matches[0] || null;
+  }
+
   function summarizeEndpointResponse(json) {
     const direct = summarizePlayerResponse(json);
     const nestedPlayers = findPlayerLikeObjects(json);
-    const bestNested = nestedPlayers.find(p => playerSummaryIsUsable(p.summary)) || nestedPlayers[0] || null;
+    // Strip value references before storing in the summary (path + summary only)
+    const nestedPlayersSafe = nestedPlayers.map(p => ({ path: p.path, summary: p.summary }));
+    const bestNested = nestedPlayersSafe.find(p => playerSummaryIsUsable(p.summary)) || nestedPlayersSafe[0] || null;
     const directUsable = playerSummaryIsUsable(direct);
 
     return {
       direct,
       directUsable,
       nestedPlayerCount: nestedPlayers.length,
-      nestedPlayers: nestedPlayers.slice(0, 8),
+      nestedPlayers: nestedPlayersSafe.slice(0, 8),
       bestNested,
-      bestUsable: directUsable || !!nestedPlayers.find(p => playerSummaryIsUsable(p.summary)),
+      bestUsable: directUsable || !!nestedPlayersSafe.find(p => playerSummaryIsUsable(p.summary)),
       topKeys: json ? Object.keys(json).slice(0, 80) : [],
     };
   }
@@ -469,6 +482,20 @@ yt-source-swap-test.js text/javascript
         "content-type": "application/json; charset=utf-8",
         "x-chroma-source-swap": "web-old-version",
       },
+    });
+  }
+
+  function makeJsonResponseFromOriginal(originalResp, json) {
+    const headers = new Headers(originalResp.headers);
+    headers.set("content-type", "application/json; charset=utf-8");
+    headers.set("x-chroma-source-swap", "container-streamingData-patch");
+    headers.delete("content-length");
+    headers.delete("content-encoding");
+
+    return new Response(JSON.stringify(json), {
+      status: originalResp.status,
+      statusText: originalResp.statusText,
+      headers,
     });
   }
 
@@ -576,11 +603,122 @@ yt-source-swap-test.js text/javascript
   function validReplacement(result) {
     if (!result.ok) return false;
 
+    // Only /player responses may be used as full whole-response replacements.
+    if (result.endpoint !== "player") {
+      return false;
+    }
+
     if (!config.requireStreamingDataProof) {
       return true;
     }
 
     return !!result.endpointSummary?.bestUsable;
+  }
+
+  async function tryPatchContainerResponse(meta, input, init) {
+    const endpoint = meta.endpoint || endpointForUrl(meta.url);
+
+    counters.attempts++;
+    counters.lastReason = "attempting-container-patch";
+    counters.lastTransport = meta.transport;
+    counters.lastEndpoint = endpoint;
+    countAttemptEndpoint(endpoint);
+
+    if (meta.transport === "fetch") counters.attemptsFetch++;
+    if (meta.transport === "xhr") counters.attemptsXhr++;
+
+    remember({
+      event: "attempt-container-patch",
+      transport: meta.transport,
+      endpoint,
+      originalClientName: meta.bodyJson?.context?.client?.clientName || "",
+      originalClientVersion: meta.bodyJson?.context?.client?.clientVersion || "",
+      targetVersion: config.targetVersion,
+      bodyType: meta.bodyType,
+      bodyTextLength: meta.bodyTextLength,
+      topKeys: meta.bodyJson ? Object.keys(meta.bodyJson).slice(0, 40) : [],
+    });
+
+    const originalResp = await nativeFetch(input, init);
+    const originalText = await originalResp.clone().text();
+    const originalJson = safeJson(originalText);
+
+    if (!originalResp.ok || !originalJson) {
+      counters.fallback++;
+      counters.lastReason = "original-container-invalid";
+      remember({
+        event: "fallback-container-patch",
+        transport: meta.transport,
+        endpoint,
+        reason: counters.lastReason,
+        httpStatus: originalResp.status,
+      });
+      return originalResp;
+    }
+
+    const oldResult = await fetchOldWebEndpoint(meta);
+    const oldPlayer = findBestUsablePlayerObject(oldResult.json);
+    const modernPlayer = findFirstModernPlayerObject(originalJson);
+
+    if (!oldResult.ok || !oldPlayer || !modernPlayer?.value) {
+      counters.fallback++;
+      counters.lastReason = "no-usable-old-player-for-container-patch";
+
+      remember({
+        event: "fallback-container-patch",
+        transport: meta.transport,
+        endpoint,
+        reason: counters.lastReason,
+        oldHttpStatus: oldResult.httpStatus,
+        oldNestedPlayerCount: oldResult.endpointSummary?.nestedPlayerCount || 0,
+        oldBestUsable: !!oldPlayer,
+        modernHasPlayer: !!modernPlayer,
+        oldBestPath: oldPlayer?.path || "",
+        modernPath: modernPlayer?.path || "",
+      });
+
+      return originalResp;
+    }
+
+    modernPlayer.value.streamingData = cloneJson(oldPlayer.value.streamingData);
+
+    const patchedSummary = summarizePlayerResponse(modernPlayer.value);
+
+    if (!playerSummaryIsUsable(patchedSummary)) {
+      counters.fallback++;
+      counters.lastReason = "patched-container-not-usable";
+
+      remember({
+        event: "fallback-container-patch",
+        transport: meta.transport,
+        endpoint,
+        reason: counters.lastReason,
+        oldPath: oldPlayer.path,
+        modernPath: modernPlayer.path,
+        patchedSummary,
+      });
+
+      return originalResp;
+    }
+
+    counters.success++;
+    counters.lastReason = "container-patched";
+    countSuccessEndpoint(endpoint);
+
+    if (meta.transport === "fetch") counters.successFetch++;
+    if (meta.transport === "xhr") counters.successXhr++;
+
+    remember({
+      event: "container-patch",
+      transport: meta.transport,
+      endpoint,
+      oldPath: oldPlayer.path,
+      modernPath: modernPlayer.path,
+      oldSummary: oldPlayer.summary,
+      patchedSummary,
+    });
+
+    return makeJsonResponseFromOriginal(originalResp, originalJson);
   }
 
   function countAttemptEndpoint(endpoint) {
@@ -700,6 +838,13 @@ yt-source-swap-test.js text/javascript
         counters.lastReason = reason;
         rememberSeenYoutubei(meta, reason);
         return nativeFetch.apply(this, arguments);
+      }
+
+      const endpoint = meta.endpoint || endpointForUrl(meta.url);
+
+      // get_watch and next are container-patch endpoints, not replacement endpoints.
+      if (endpoint === "get_watch" || endpoint === "next") {
+        return await tryPatchContainerResponse(meta, input, init);
       }
 
       const result = await trySwap(meta);
@@ -860,6 +1005,23 @@ yt-source-swap-test.js text/javascript
           counters.ignored++;
           counters.lastReason = reason;
           rememberSeenYoutubei(meta, reason);
+          return nativeSend.call(xhr, body);
+        }
+
+        const endpoint = meta.endpoint || endpointForUrl(meta.url);
+
+        // Container patching requires a real fetch-based original response; XHR path is not supported.
+        if (endpoint === "get_watch" || endpoint === "next") {
+          counters.ignored++;
+          counters.lastReason = "container-patch-fetch-only";
+
+          remember({
+            event: "ignored-container-xhr",
+            transport: "xhr",
+            endpoint,
+            reason: "container-patch-fetch-only",
+          });
+
           return nativeSend.call(xhr, body);
         }
 
