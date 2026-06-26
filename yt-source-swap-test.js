@@ -1028,6 +1028,10 @@ yt-source-swap-test.js text/javascript
       const result = cloneAdaptiveClassicStreamingData(streamingData);
       cloned.streamingData = result.streamingData;
       sourceSwapSelection = result.adaptiveClassicSelection;
+    } else if (config.classicPatchMode === "webcreator-adaptive-classic-full") {
+      const result = cloneWebCreatorClassicFullStreamingData(streamingData);
+      cloned.streamingData = result.streamingData;
+      sourceSwapSelection = result.adaptiveClassicSelection;
     } else {
       cloned.streamingData = cloneClassicOnlyStreamingData(streamingData);
     }
@@ -1190,8 +1194,14 @@ yt-source-swap-test.js text/javascript
       ? streamingData.adaptiveFormats
       : [];
 
-    if (formats.length !== 0) return false;
-    if (adaptiveFormats.length !== 2) return false;
+    if (config.classicPatchMode === "webcreator-adaptive-classic-auto") {
+      if (formats.length !== 0) return false;
+      if (adaptiveFormats.length !== 2) return false;
+    }
+
+    if (config.classicPatchMode === "webcreator-adaptive-classic-full") {
+      if (adaptiveFormats.length < 2) return false;
+    }
 
     const hasVideo = adaptiveFormats.some(format =>
       isVideoFormat(format) &&
@@ -1223,6 +1233,76 @@ yt-source-swap-test.js text/javascript
     return {
       streamingData: clean,
       adaptiveClassicSelection: summarizeAdaptiveClassicPair(pair),
+    };
+  }
+
+  function summarizeWebCreatorClassicFull(streamingData) {
+    const formats = Array.isArray(streamingData?.formats) ? streamingData.formats : [];
+    const adaptiveFormats = Array.isArray(streamingData?.adaptiveFormats)
+      ? streamingData.adaptiveFormats
+      : [];
+
+    const videos = adaptiveFormats
+      .filter(format => isVideoFormat(format) && isUsableClassicFormat(format))
+      .sort((a, b) => {
+        const heightDelta = getFormatHeight(b) - getFormatHeight(a);
+        if (heightDelta) return heightDelta;
+        return getFormatBitrate(b) - getFormatBitrate(a);
+      });
+
+    const audios = adaptiveFormats
+      .filter(format => isAudioFormat(format) && isUsableClassicFormat(format))
+      .sort((a, b) => getFormatBitrate(b) - getFormatBitrate(a));
+
+    return {
+      mode: "webcreator-adaptive-classic-full",
+      progressiveCount: formats.length,
+      adaptiveCount: adaptiveFormats.length,
+      adaptiveVideoCount: videos.length,
+      adaptiveAudioCount: audios.length,
+      hasPair: !!videos.length && !!audios.length,
+      bestVideo: videos[0]
+        ? {
+            itag: videos[0].itag || "",
+            mimeType: videos[0].mimeType || "",
+            qualityLabel: videos[0].qualityLabel || "",
+            height: getFormatHeight(videos[0]),
+            bitrate: getFormatBitrate(videos[0]),
+            mode: getFormatUrlMode(videos[0]),
+          }
+        : null,
+      bestAudio: audios[0]
+        ? {
+            itag: audios[0].itag || "",
+            mimeType: audios[0].mimeType || "",
+            bitrate: getFormatBitrate(audios[0]),
+            mode: getFormatUrlMode(audios[0]),
+          }
+        : null,
+    };
+  }
+
+  function cloneWebCreatorClassicFullStreamingData(streamingData) {
+    const clean = cloneJson(streamingData || {});
+
+    delete clean.serverAbrStreamingUrl;
+    delete clean.sabrStreamingUrl;
+    delete clean.serverAbrStreamingUrlConfig;
+
+    const formats = Array.isArray(clean.formats) ? clean.formats : [];
+    const adaptiveFormats = Array.isArray(clean.adaptiveFormats) ? clean.adaptiveFormats : [];
+
+    clean.formats = formats
+      .filter(format => isUsableClassicFormat(format))
+      .map(format => cloneJson(format));
+
+    clean.adaptiveFormats = adaptiveFormats
+      .filter(format => isUsableClassicFormat(format))
+      .map(format => cloneJson(format));
+
+    return {
+      streamingData: clean,
+      adaptiveClassicSelection: summarizeWebCreatorClassicFull(clean),
     };
   }
 
@@ -1264,7 +1344,10 @@ yt-source-swap-test.js text/javascript
         hasMwebProgressiveAutoCandidate(streamingData);
 
       const canUseAdaptiveClassic =
-        config.classicPatchMode === "webcreator-adaptive-classic-auto" &&
+        (
+          config.classicPatchMode === "webcreator-adaptive-classic-auto" ||
+          config.classicPatchMode === "webcreator-adaptive-classic-full"
+        ) &&
         hasUsableAdaptiveClassicPair(streamingData);
 
       if (!canUseDirectClassic && !canUseRawCipher && !canUseAuto && !canUseAdaptiveClassic) {
@@ -1293,7 +1376,10 @@ yt-source-swap-test.js text/javascript
         hasPatchedProgressiveAutoCandidate(synthetic.streamingData);
 
       const adaptiveClassicOk =
-        config.classicPatchMode === "webcreator-adaptive-classic-auto" &&
+        (
+          config.classicPatchMode === "webcreator-adaptive-classic-auto" ||
+          config.classicPatchMode === "webcreator-adaptive-classic-full"
+        ) &&
         summary.status === "OK" &&
         !summary.hasSabr &&
         !summary.hasServerAbr &&
@@ -1328,7 +1414,10 @@ yt-source-swap-test.js text/javascript
   }
 
   function selectTargetPlayerForCurrentMode(root, wantedVideoId = "") {
-    if (config.classicPatchMode === "webcreator-adaptive-classic-auto") {
+    if (
+      config.classicPatchMode === "webcreator-adaptive-classic-auto" ||
+      config.classicPatchMode === "webcreator-adaptive-classic-full"
+    ) {
       const adaptiveClassicTarget = findClassicOnlyCandidateForVideo(root, wantedVideoId);
 
       if (adaptiveClassicTarget) {
@@ -1773,7 +1862,10 @@ yt-source-swap-test.js text/javascript
       hasSelectedProgressiveItag18(modernPlayer.value.streamingData);
 
     const patchedAdaptiveClassicOk =
-      config.classicPatchMode === "webcreator-adaptive-classic-auto" &&
+      (
+        config.classicPatchMode === "webcreator-adaptive-classic-auto" ||
+        config.classicPatchMode === "webcreator-adaptive-classic-full"
+      ) &&
       patchedSummary.status === "OK" &&
       !patchedSummary.hasSabr &&
       !patchedSummary.hasServerAbr &&
@@ -1865,7 +1957,10 @@ yt-source-swap-test.js text/javascript
       progressiveAutoSelection: config.classicPatchMode === "mweb-progressive-auto"
         ? targetPlayer.sourceSwapSelection || null
         : null,
-      adaptiveClassicSelection: config.classicPatchMode === "webcreator-adaptive-classic-auto"
+      adaptiveClassicSelection: (
+        config.classicPatchMode === "webcreator-adaptive-classic-auto" ||
+        config.classicPatchMode === "webcreator-adaptive-classic-full"
+      )
         ? targetPlayer.sourceSwapSelection || null
         : null,
       rawCipherCandidate: hasProgressiveRawCipherCandidate(targetPlayer.value.streamingData),
@@ -1884,7 +1979,10 @@ yt-source-swap-test.js text/javascript
       progressiveAutoSelection: config.classicPatchMode === "mweb-progressive-auto"
         ? targetPlayer.sourceSwapSelection || null
         : null,
-      adaptiveClassicSelection: config.classicPatchMode === "webcreator-adaptive-classic-auto"
+      adaptiveClassicSelection: (
+        config.classicPatchMode === "webcreator-adaptive-classic-auto" ||
+        config.classicPatchMode === "webcreator-adaptive-classic-full"
+      )
         ? targetPlayer.sourceSwapSelection || null
         : null,
     };
@@ -2420,6 +2518,16 @@ yt-source-swap-test.js text/javascript
       config.endpoints.getWatch = true;
       config.endpoints.next = false;
       console.log("[yt-source-swap] using WEB_CREATOR adaptive classic fallback");
+    },
+
+    useWebCreatorAdaptiveFull() {
+      config.targetProfile = "webCreator";
+      config.classicPatchMode = "webcreator-adaptive-classic-full";
+      config.patchPolicy = "always";
+      config.endpoints.player = false;
+      config.endpoints.getWatch = true;
+      config.endpoints.next = false;
+      console.log("[yt-source-swap] using WEB_CREATOR full adaptive classic fallback");
     },
 
     copyEvents() {
