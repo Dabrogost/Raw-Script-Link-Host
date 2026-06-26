@@ -1655,14 +1655,17 @@ yt-source-swap-test.js text/javascript
       progressiveAutoSelection: targetPlayer.sourceSwapSelection || null,
     };
 
+    const patchSnapshot = cloneJson(lastPatch);
+
     setTimeout(() => {
       remember({
         event: "video-state-after-patch",
         delayMs: 1000,
-        patchAgeMs: Number.isFinite(lastPatch.time)
-          ? Math.round(performance.now() - lastPatch.time)
+        pageVideoId: getCurrentPageVideoId(),
+        patchAgeMs: Number.isFinite(patchSnapshot.time)
+          ? Math.round(performance.now() - patchSnapshot.time)
           : null,
-        recentPatch: lastPatch,
+        recentPatch: patchSnapshot,
         videoState: summarizeVideoElementState(),
       });
     }, 1000);
@@ -1671,10 +1674,11 @@ yt-source-swap-test.js text/javascript
       remember({
         event: "video-state-after-patch",
         delayMs: 5000,
-        patchAgeMs: Number.isFinite(lastPatch.time)
-          ? Math.round(performance.now() - lastPatch.time)
+        pageVideoId: getCurrentPageVideoId(),
+        patchAgeMs: Number.isFinite(patchSnapshot.time)
+          ? Math.round(performance.now() - patchSnapshot.time)
           : null,
-        recentPatch: lastPatch,
+        recentPatch: patchSnapshot,
         videoState: summarizeVideoElementState(),
       });
     }, 5000);
