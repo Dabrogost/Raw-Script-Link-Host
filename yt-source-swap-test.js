@@ -27,9 +27,9 @@ yt-source-swap-test.js text/javascript
     interceptFetch: true,
     interceptXhr: true,
     endpoints: {
-      player: true,
+      player: false,
       getWatch: true,
-      next: true,
+      next: false,
     },
   };
 
@@ -92,6 +92,74 @@ yt-source-swap-test.js text/javascript
 
   function isUsefulYoutubeiUrl(url) {
     return !!endpointForUrl(url);
+  }
+
+  function getCurrentPageVideoId() {
+    return (
+      document.querySelector("ytd-watch-flexy")?.getAttribute("video-id") ||
+      new URL(location.href).searchParams.get("v") ||
+      ""
+    );
+  }
+
+  function getBodyVideoId(bodyJson) {
+    return (
+      bodyJson?.videoId ||
+      bodyJson?.playerRequest?.videoId ||
+      bodyJson?.watchNextRequest?.videoId ||
+      bodyJson?.watchEndpoint?.videoId ||
+      bodyJson?.continuation ||
+      ""
+    );
+  }
+
+  function stripPlayerAdState(playerResponse) {
+    if (!playerResponse || typeof playerResponse !== "object") return;
+
+    const keys = [
+      "adPlacements",
+      "adSlots",
+      "playerAds",
+      "adBreakParams",
+      "adBreakHeartbeatParams",
+      "adInferredBlockingStatus",
+      "adSignalsInfo",
+      "playerAttestationRenderer",
+      "adSafetyReason",
+      "paidContentOverlay",
+    ];
+
+    for (const key of keys) {
+      delete playerResponse[key];
+    }
+  }
+
+  function summarizeAdState(playerResponse) {
+    if (!playerResponse || typeof playerResponse !== "object") {
+      return {
+        playerAds: 0,
+        adPlacements: 0,
+        adSlots: 0,
+        hasAdBreakHeartbeatParams: false,
+        hasAdBreakParams: false,
+        hasAdInferredBlockingStatus: false,
+        adKeys: [],
+      };
+    }
+
+    const adKeys = Object.keys(playerResponse).filter(key =>
+      /ad|paid|attestation/i.test(key)
+    );
+
+    return {
+      playerAds: Array.isArray(playerResponse.playerAds) ? playerResponse.playerAds.length : 0,
+      adPlacements: Array.isArray(playerResponse.adPlacements) ? playerResponse.adPlacements.length : 0,
+      adSlots: Array.isArray(playerResponse.adSlots) ? playerResponse.adSlots.length : 0,
+      hasAdBreakHeartbeatParams: !!playerResponse.adBreakHeartbeatParams,
+      hasAdBreakParams: !!playerResponse.adBreakParams,
+      hasAdInferredBlockingStatus: !!playerResponse.adInferredBlockingStatus,
+      adKeys,
+    };
   }
 
   function isEndpointEnabled(endpoint) {
@@ -631,6 +699,8 @@ yt-source-swap-test.js text/javascript
       event: "attempt-container-patch",
       transport: meta.transport,
       endpoint,
+      pageVideoId: getCurrentPageVideoId(),
+      requestVideoId: getBodyVideoId(meta.bodyJson),
       originalClientName: meta.bodyJson?.context?.client?.clientName || "",
       originalClientVersion: meta.bodyJson?.context?.client?.clientVersion || "",
       targetVersion: config.targetVersion,
@@ -650,6 +720,7 @@ yt-source-swap-test.js text/javascript
         event: "fallback-container-patch",
         transport: meta.transport,
         endpoint,
+        pageVideoId: getCurrentPageVideoId(),
         reason: counters.lastReason,
         httpStatus: originalResp.status,
       });
@@ -668,6 +739,7 @@ yt-source-swap-test.js text/javascript
         event: "fallback-container-patch",
         transport: meta.transport,
         endpoint,
+        pageVideoId: getCurrentPageVideoId(),
         reason: counters.lastReason,
         oldHttpStatus: oldResult.httpStatus,
         oldNestedPlayerCount: oldResult.endpointSummary?.nestedPlayerCount || 0,
@@ -680,21 +752,37 @@ yt-source-swap-test.js text/javascript
       return originalResp;
     }
 
+    // Patch only streamingData — do not copy old playerResponse wholesale.
     modernPlayer.value.streamingData = cloneJson(oldPlayer.value.streamingData);
+
+    // Strip ad state from the patched modern playerResponse to avoid
+    // inconsistent state: modern ad-eligible object + old non-SABR stream.
+    const adStateBeforeStrip = summarizeAdState(modernPlayer.value);
+    stripPlayerAdState(modernPlayer.value);
+    const adStateAfterStrip = summarizeAdState(modernPlayer.value);
 
     const patchedSummary = summarizePlayerResponse(modernPlayer.value);
 
-    if (!playerSummaryIsUsable(patchedSummary)) {
+    // Require the patch to be usable AND ad-state to be fully clean.
+    if (
+      !playerSummaryIsUsable(patchedSummary) ||
+      adStateAfterStrip.playerAds !== 0 ||
+      adStateAfterStrip.adSlots !== 0 ||
+      adStateAfterStrip.hasAdBreakHeartbeatParams
+    ) {
       counters.fallback++;
-      counters.lastReason = "patched-container-not-usable";
+      counters.lastReason = "patched-container-ad-state-not-clean";
 
       remember({
         event: "fallback-container-patch",
         transport: meta.transport,
         endpoint,
+        pageVideoId: getCurrentPageVideoId(),
         reason: counters.lastReason,
         oldPath: oldPlayer.path,
         modernPath: modernPlayer.path,
+        adStateBeforeStrip,
+        adStateAfterStrip,
         patchedSummary,
       });
 
@@ -712,8 +800,12 @@ yt-source-swap-test.js text/javascript
       event: "container-patch",
       transport: meta.transport,
       endpoint,
+      pageVideoId: getCurrentPageVideoId(),
+      requestVideoId: getBodyVideoId(meta.bodyJson),
       oldPath: oldPlayer.path,
       modernPath: modernPlayer.path,
+      adStateBeforeStrip,
+      adStateAfterStrip,
       oldSummary: oldPlayer.summary,
       patchedSummary,
     });
