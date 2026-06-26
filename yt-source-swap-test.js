@@ -650,6 +650,11 @@ yt-source-swap-test.js text/javascript
     return matches[0] || null;
   }
 
+  function findFirstPlayerObject(root) {
+    const matches = findPlayerLikeObjects(root);
+    return matches[0] || null;
+  }
+
   function summarizeEndpointResponse(json) {
     const direct = summarizePlayerResponse(json);
     const nestedPlayers = findPlayerLikeObjects(json);
@@ -909,6 +914,7 @@ yt-source-swap-test.js text/javascript
         });
 
         const playerTarget = findBestUsablePlayerObjectForVideo(playerResult.json, wantedVideoId);
+        const firstPlayerTarget = findFirstPlayerObject(playerResult.json);
 
         remember({
           event: "target-player-from-container-result",
@@ -924,6 +930,19 @@ yt-source-swap-test.js text/javascript
           targetBestUsable: !!playerTarget,
           targetBestPath: playerTarget?.path || "",
           targetSummary: playerTarget?.summary || null,
+
+          firstTargetPath: firstPlayerTarget?.path || "",
+          firstTargetSummary: firstPlayerTarget?.summary || null,
+
+          rejectedBecause: firstPlayerTarget
+            ? {
+                statusNotOk: firstPlayerTarget.summary?.status !== "OK",
+                missingStreamingData: !firstPlayerTarget.summary?.hasStreamingData,
+                hasSabr: !!firstPlayerTarget.summary?.hasSabr,
+                hasServerAbr: !!firstPlayerTarget.summary?.hasServerAbr,
+              }
+            : null,
+
           textPreview: playerResult.textPreview || "",
           topKeys: playerResult.json ? Object.keys(playerResult.json).slice(0, 80) : [],
         });
