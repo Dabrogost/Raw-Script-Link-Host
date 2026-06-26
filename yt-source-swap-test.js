@@ -135,6 +135,8 @@ yt-source-swap-test.js text/javascript
     handoffInProgress: false,
   };
 
+  const HYBRID_SESSION_KEY = "__yt_source_swap_hybrid_handoff__";
+
   function log(...args) {
     if (config.logVerbose) {
       console.log("%c[yt-source-swap]", "font-weight:bold;color:#2b7", ...args);
@@ -1513,6 +1515,64 @@ yt-source-swap-test.js text/javascript
     return !!config.hybridStartup?.enabled;
   }
 
+  function readPersistedHybridHandoff() {
+    try {
+      const raw = sessionStorage.getItem(HYBRID_SESSION_KEY);
+      if (!raw) return null;
+
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object") return null;
+
+      return {
+        videoId: String(parsed.videoId || ""),
+        expiresAt: Number(parsed.expiresAt || 0),
+        resumeAt: Number(parsed.resumeAt || 0),
+        createdAt: Number(parsed.createdAt || 0),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  function clearPersistedHybridHandoff() {
+    try {
+      sessionStorage.removeItem(HYBRID_SESSION_KEY);
+    } catch {}
+  }
+
+  function persistHybridHandoff(videoId, resumeAt) {
+    if (!videoId) return;
+
+    const now = Date.now();
+    const ttlMs = Number(config.hybridStartup?.handoffCooldownMs || 30000);
+
+    try {
+      sessionStorage.setItem(HYBRID_SESSION_KEY, JSON.stringify({
+        videoId,
+        resumeAt: Number(resumeAt || 0),
+        createdAt: now,
+        expiresAt: now + ttlMs,
+      }));
+    } catch {}
+  }
+
+  function getActivePersistedHybridBypass(videoId) {
+    const persisted = readPersistedHybridHandoff();
+
+    if (!persisted?.videoId) return null;
+
+    if (Date.now() > persisted.expiresAt) {
+      clearPersistedHybridHandoff();
+      return null;
+    }
+
+    if (videoId && persisted.videoId !== videoId) {
+      return null;
+    }
+
+    return persisted;
+  }
+
   function getWatchUrlWithTimestamp(videoId, seconds) {
     const url = new URL(location.href);
     url.pathname = "/watch";
@@ -1523,6 +1583,9 @@ yt-source-swap-test.js text/javascript
 
   function hasHybridHandoffRecently(videoId) {
     if (!videoId) return false;
+
+    const persisted = getActivePersistedHybridBypass(videoId);
+    if (persisted) return true;
 
     const last = hybridState.handoffAttemptedByVideoId.get(videoId) || 0;
     const age = performance.now() - last;
@@ -1603,6 +1666,8 @@ yt-source-swap-test.js text/javascript
       const resumeAt = Math.max(0, currentTime - 0.25);
       const targetUrl = getWatchUrlWithTimestamp(videoId, resumeAt);
 
+      persistHybridHandoff(videoId, resumeAt);
+
       config.enabled = false;
 
       remember({
@@ -1646,8 +1711,15 @@ yt-source-swap-test.js text/javascript
       return [false, "no-video-id"];
     }
 
+    const sourceVideoId = getBodyVideoId(meta.bodyJson) || getCurrentPageVideoId();
+    const persistedHybridBypass = getActivePersistedHybridBypass(sourceVideoId);
+
+    if (persistedHybridBypass) {
+      return [false, "hybrid-persisted-bypass-after-handoff"];
+    }
+
     if (isHybridStartupMode()) {
-      const videoId = getBodyVideoId(meta.bodyJson) || getCurrentPageVideoId();
+      const videoId = sourceVideoId;
 
       if (hasHybridHandoffRecently(videoId)) {
         return [false, "hybrid-handoff-already-attempted"];
@@ -2729,7 +2801,23 @@ yt-source-swap-test.js text/javascript
       hybridState.handoffAttemptedByVideoId.clear();
       hybridState.handoffInProgress = false;
       clearHybridHandoffTimer();
+      clearPersistedHybridHandoff();
       console.log("[yt-source-swap] cleared hybrid handoff memory");
+    },
+
+    hybridStatus() {
+      const pageVideoId = getCurrentPageVideoId();
+      const persisted = readPersistedHybridHandoff();
+
+      return {
+        pageVideoId,
+        config: cloneJson(config.hybridStartup),
+        handoffInProgress: hybridState.handoffInProgress,
+        activeVideoId: hybridState.activeVideoId,
+        activePatchVideoId: hybridState.activePatchVideoId,
+        persisted,
+        persistedApplies: !!getActivePersistedHybridBypass(pageVideoId),
+      };
     },
 
     copyEvents() {
