@@ -72,6 +72,7 @@ yt-source-swap-test.js text/javascript
     allowClassicOnlyFromSabrTargets: true,
     classicPatchMode: "mweb-progressive-auto",
     allowCipherUrlWithoutDecipher: false,
+    patchPolicy: "always",
     endpoints: {
       player: false,
       getWatch: true,
@@ -879,18 +880,6 @@ yt-source-swap-test.js text/javascript
     );
   }
 
-  function hasRawClassicCipher(format) {
-    const cipher = format?.signatureCipher || format?.cipher || "";
-    if (!cipher) return false;
-
-    const parsed = parseCipherString(cipher);
-    return isClassicNonSabrUrl(parsed.url);
-  }
-
-  function hasDirectClassicUrlOrCipher(format) {
-    return hasDirectClassicUrl(format) || hasRawClassicCipher(format);
-  }
-
   function hasProgressiveRawCipherCandidate(streamingData) {
     const formats = Array.isArray(streamingData?.formats) ? streamingData.formats : [];
 
@@ -996,26 +985,31 @@ yt-source-swap-test.js text/javascript
     );
 
     const selected = direct || rawCipher || null;
-    const selectedMode = direct ? "direct-url" : rawCipher ? "raw-cipher" : "";
 
-    clean.formats = selected ? [cloneJson(selected)] : [];
-    clean.adaptiveFormats = [];
-
-    clean.__sourceSwapSelection = {
-      selectedMode,
+    const selection = {
+      selectedMode: direct ? "direct-url" : rawCipher ? "raw-cipher" : "",
       selectedItag: selected ? String(selected.itag || "") : "",
       hadDirectCandidate: !!direct,
       hadRawCipherCandidate: !!rawCipher,
     };
 
-    return clean;
+    clean.formats = selected ? [cloneJson(selected)] : [];
+    clean.adaptiveFormats = [];
+
+    return {
+      streamingData: clean,
+      selection,
+    };
   }
 
   function makeSyntheticPlayerWithStreamingData(basePlayer, streamingData) {
     const cloned = cloneJson(basePlayer || {});
+    let sourceSwapSelection = null;
 
     if (config.classicPatchMode === "mweb-progressive-auto") {
-      cloned.streamingData = cloneMwebProgressiveAutoStreamingData(streamingData);
+      const result = cloneMwebProgressiveAutoStreamingData(streamingData);
+      cloned.streamingData = result.streamingData;
+      sourceSwapSelection = result.selection;
     } else if (config.classicPatchMode === "progressive-only") {
       cloned.streamingData = cloneProgressiveOnlyStreamingData(streamingData);
     } else if (config.classicPatchMode === "progressive-cipher-url-only") {
@@ -1026,7 +1020,10 @@ yt-source-swap-test.js text/javascript
       cloned.streamingData = cloneClassicOnlyStreamingData(streamingData);
     }
 
-    return cloned;
+    return {
+      player: cloned,
+      sourceSwapSelection,
+    };
   }
 
   function hasPlayableProgressiveCandidate(streamingData) {
@@ -1035,6 +1032,29 @@ yt-source-swap-test.js text/javascript
     return formats.some(format =>
       isProgressiveFormat(format) &&
       hasDirectClassicUrlOrCipher(format)
+    );
+  }
+
+  function hasSelectedProgressiveItag18(streamingData) {
+    const formats = Array.isArray(streamingData?.formats) ? streamingData.formats : [];
+
+    return (
+      formats.length === 1 &&
+      formats.some(format => {
+        const kind = classifyProgressiveCandidate(format);
+        return kind === "direct-url" || kind === "raw-cipher";
+      })
+    );
+  }
+
+  function hasMeaningfulAdState(adState) {
+    return (
+      adState.playerAds > 0 ||
+      adState.adPlacements > 0 ||
+      adState.adSlots > 0 ||
+      adState.hasAdBreakHeartbeatParams ||
+      adState.hasAdBreakParams ||
+      adState.hasAdInferredBlockingStatus
     );
   }
 
@@ -1068,8 +1088,12 @@ yt-source-swap-test.js text/javascript
         continue;
       }
 
-      const synthetic = makeSyntheticPlayerWithStreamingData(match.value, streamingData);
+      const syntheticResult = makeSyntheticPlayerWithStreamingData(match.value, streamingData);
+      const synthetic = syntheticResult.player;
+      const sourceSwapSelection = syntheticResult.sourceSwapSelection;
       const summary = summarizePlayerResponse(synthetic);
+
+      const baseUsable = playerSummaryIsUsable(summary);
 
       const progressiveRawCipherOk =
         config.classicPatchMode === "progressive-raw-cipher" &&
@@ -1085,7 +1109,16 @@ yt-source-swap-test.js text/javascript
         !summary.hasServerAbr &&
         hasPatchedProgressiveAutoCandidate(synthetic.streamingData);
 
-      if (playerSummaryIsUsable(summary) || progressiveRawCipherOk || progressiveAutoOk) {
+      const acceptedBy =
+        progressiveAutoOk
+          ? "progressiveAutoOk"
+          : progressiveRawCipherOk
+            ? "progressiveRawCipherOk"
+            : baseUsable
+              ? "playerSummaryIsUsable"
+              : "";
+
+      if (acceptedBy) {
         return {
           path: match.path,
           value: synthetic,
@@ -1093,11 +1126,8 @@ yt-source-swap-test.js text/javascript
           originalSummary: match.summary,
           streamingDetails: details,
           mode: config.classicPatchMode,
-          acceptedBy: playerSummaryIsUsable(summary)
-            ? "playerSummaryIsUsable"
-            : progressiveAutoOk
-              ? "progressiveAutoOk"
-              : "progressiveRawCipherOk",
+          acceptedBy,
+          sourceSwapSelection,
         };
       }
     }
@@ -1478,29 +1508,58 @@ yt-source-swap-test.js text/javascript
     // Strip ad state from the patched modern playerResponse to avoid
     // inconsistent state: modern ad-eligible object + target non-SABR stream.
     const adStateBeforeStrip = summarizeAdState(modernPlayer.value);
+
+    if (
+      config.patchPolicy === "ad-state-only" &&
+      !hasMeaningfulAdState(adStateBeforeStrip)
+    ) {
+      counters.fallback++;
+      counters.lastReason = "patch-policy-no-ad-state";
+
+      remember({
+        event: "fallback-container-patch",
+        transport: meta.transport,
+        endpoint,
+        reason: counters.lastReason,
+        sourceMode: lastTargetResult?.sourceMode || "",
+        targetProfile: lastTargetResult?.targetProfile || getTargetProfile().key,
+        targetClientName: lastTargetResult?.targetClientName || getTargetProfile().clientName,
+        targetClientVersion: lastTargetResult?.targetClientVersion || getTargetProfile().clientVersion,
+        targetHttpStatus: lastTargetResult?.httpStatus || 0,
+        targetNestedPlayerCount: lastTargetResult?.endpointSummary?.nestedPlayerCount || 0,
+        targetBestUsable: !!targetPlayer,
+        requestVideoId: wantedVideoId,
+        pageVideoId: getCurrentPageVideoId(),
+        targetBestPath: targetPlayer?.path || "",
+        targetPath: targetPlayer?.path || "",
+        modernPath: modernPlayer.path,
+        adStateBeforeStrip,
+        targetSelectionMode,
+        classicPatchMode: config.classicPatchMode,
+      });
+
+      return originalResp;
+    }
+
     stripPlayerAdState(modernPlayer.value);
     const adStateAfterStrip = summarizeAdState(modernPlayer.value);
 
     const patchedSummary = summarizePlayerResponse(modernPlayer.value);
 
-    const patchedProgressiveRawCipherOk =
-      config.classicPatchMode === "progressive-raw-cipher" &&
+    const patchedProgressiveFallbackOk =
+      (
+        config.classicPatchMode === "mweb-progressive-auto" ||
+        config.classicPatchMode === "progressive-raw-cipher" ||
+        config.classicPatchMode === "progressive-only"
+      ) &&
       patchedSummary.status === "OK" &&
       !patchedSummary.hasSabr &&
       !patchedSummary.hasServerAbr &&
-      hasPlayableProgressiveCandidate(modernPlayer.value.streamingData);
-
-    const patchedProgressiveAutoOk =
-      config.classicPatchMode === "mweb-progressive-auto" &&
-      patchedSummary.status === "OK" &&
-      !patchedSummary.hasSabr &&
-      !patchedSummary.hasServerAbr &&
-      hasPatchedProgressiveAutoCandidate(modernPlayer.value.streamingData);
+      hasSelectedProgressiveItag18(modernPlayer.value.streamingData);
 
     const patchedUsable =
-      playerSummaryIsUsable(patchedSummary) ||
-      patchedProgressiveRawCipherOk ||
-      patchedProgressiveAutoOk;
+      patchedProgressiveFallbackOk ||
+      playerSummaryIsUsable(patchedSummary);
 
     // Require the patch to be usable AND ad-state to be fully clean.
     if (
@@ -1580,8 +1639,7 @@ yt-source-swap-test.js text/javascript
       adStateBeforeStrip,
       adStateAfterStrip,
       classicPatchMode: config.classicPatchMode,
-      progressiveAutoSelection:
-        targetPlayer.value.streamingData?.__sourceSwapSelection || null,
+      progressiveAutoSelection: targetPlayer.sourceSwapSelection || null,
       rawCipherCandidate: hasProgressiveRawCipherCandidate(targetPlayer.value.streamingData),
       playableProgressiveCandidate: hasPlayableProgressiveCandidate(targetPlayer.value.streamingData),
       acceptedBy: targetPlayer.acceptedBy || "",
@@ -1592,12 +1650,18 @@ yt-source-swap-test.js text/javascript
       targetProfile: targetResult.targetProfile,
       sourceMode: targetResult.sourceMode,
       requestVideoId: wantedVideoId,
+      targetSelectionMode,
+      classicPatchMode: config.classicPatchMode,
+      progressiveAutoSelection: targetPlayer.sourceSwapSelection || null,
     };
 
     setTimeout(() => {
       remember({
         event: "video-state-after-patch",
         delayMs: 1000,
+        patchAgeMs: Number.isFinite(lastPatch.time)
+          ? Math.round(performance.now() - lastPatch.time)
+          : null,
         recentPatch: lastPatch,
         videoState: summarizeVideoElementState(),
       });
@@ -1607,6 +1671,9 @@ yt-source-swap-test.js text/javascript
       remember({
         event: "video-state-after-patch",
         delayMs: 5000,
+        patchAgeMs: Number.isFinite(lastPatch.time)
+          ? Math.round(performance.now() - lastPatch.time)
+          : null,
         recentPatch: lastPatch,
         videoState: summarizeVideoElementState(),
       });
@@ -1718,6 +1785,32 @@ yt-source-swap-test.js text/javascript
     return null;
   }
 
+  function getRecentPatchInfo(maxAgeMs = 15000) {
+    if (!lastPatch?.targetProfile || !Number.isFinite(lastPatch.time)) {
+      return {
+        maybeFromPatch: false,
+        recentPatchAgeMs: null,
+        recentPatch: null,
+      };
+    }
+
+    const age = performance.now() - lastPatch.time;
+
+    if (!Number.isFinite(age) || age < 0 || age > maxAgeMs) {
+      return {
+        maybeFromPatch: false,
+        recentPatchAgeMs: Number.isFinite(age) ? Math.round(age) : null,
+        recentPatch: null,
+      };
+    }
+
+    return {
+      maybeFromPatch: true,
+      recentPatchAgeMs: Math.round(age),
+      recentPatch: cloneJson(lastPatch),
+    };
+  }
+
   async function sourceSwapFetch(input, init) {
     let meta = null;
 
@@ -1735,12 +1828,7 @@ yt-source-swap-test.js text/javascript
 
       if (config.logMediaErrors && isMediaUrl(rawUrl)) {
         const resp = await nativeFetch.apply(this, arguments);
-        const recentPatchAgeMs = performance.now() - lastPatch.time;
-        const maybeFromPatch =
-          !!lastPatch.targetProfile &&
-          Number.isFinite(recentPatchAgeMs) &&
-          recentPatchAgeMs >= 0 &&
-          recentPatchAgeMs < 15000;
+        const patchInfo = getRecentPatchInfo();
 
         if (!resp.ok) {
           remember({
@@ -1749,9 +1837,7 @@ yt-source-swap-test.js text/javascript
             statusText: resp.statusText,
             activeTargetProfile: getTargetProfile().key,
             classicPatchMode: config.classicPatchMode,
-            maybeFromPatch,
-            recentPatchAgeMs: Math.round(recentPatchAgeMs),
-            recentPatch: maybeFromPatch ? lastPatch : null,
+            ...patchInfo,
             ...summarizeMediaUrl(rawUrl),
           });
         } else {
@@ -1760,9 +1846,7 @@ yt-source-swap-test.js text/javascript
             status: resp.status,
             activeTargetProfile: getTargetProfile().key,
             classicPatchMode: config.classicPatchMode,
-            maybeFromPatch,
-            recentPatchAgeMs: Math.round(recentPatchAgeMs),
-            recentPatch: maybeFromPatch ? lastPatch : null,
+            ...patchInfo,
             ...summarizeMediaUrl(rawUrl),
           });
         }
@@ -2061,6 +2145,13 @@ yt-source-swap-test.js text/javascript
       }
 
       console.log("[yt-source-swap] cleared");
+
+      lastPatch = {
+        time: -Infinity,
+        targetProfile: "",
+        sourceMode: "",
+        requestVideoId: "",
+      };
     },
 
     copyEvents() {
