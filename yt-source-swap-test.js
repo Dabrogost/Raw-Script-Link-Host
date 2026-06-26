@@ -85,7 +85,7 @@ yt-source-swap-test.js text/javascript
       enabled: false,
       handoffAtSeconds: 5,
       handoffCooldownMs: 30000,
-      reloadMethod: "location-replace",
+      reloadMethod: "player-api",
     },
     endpoints: {
       player: false,
@@ -251,6 +251,15 @@ yt-source-swap-test.js text/javascript
           }
         : null,
     };
+  }
+
+  function getMoviePlayer() {
+    return (
+      document.getElementById("movie_player") ||
+      document.querySelector("#movie_player") ||
+      document.querySelector("ytd-player #movie_player") ||
+      null
+    );
   }
 
   function playerEndpointUrl() {
@@ -1617,6 +1626,126 @@ yt-source-swap-test.js text/javascript
     }
   }
 
+  function hardHybridReload(targetUrl) {
+    try {
+      location.replace(targetUrl);
+    } catch {
+      location.href = targetUrl;
+    }
+  }
+
+  function tryHybridPlayerApiHandoff(videoId, resumeAt) {
+    const player = getMoviePlayer();
+
+    if (!player || typeof player.loadVideoById !== "function") {
+      return false;
+    }
+
+    try {
+      config.enabled = false;
+
+      remember({
+        event: "hybrid-soft-handoff-attempt",
+        method: "player-api",
+        videoId,
+        resumeAt,
+        hasLoadVideoById: typeof player.loadVideoById === "function",
+        hasLoadVideoByPlayerVars: typeof player.loadVideoByPlayerVars === "function",
+        hasCueVideoById: typeof player.cueVideoById === "function",
+        videoState: summarizeVideoElementState(),
+      });
+
+      player.loadVideoById({
+        videoId,
+        startSeconds: Math.max(0, Number(resumeAt || 0)),
+      });
+
+      remember({
+        event: "hybrid-soft-handoff-start",
+        method: "player-api",
+        videoId,
+        resumeAt,
+        videoState: summarizeVideoElementState(),
+      });
+
+      setTimeout(() => {
+        remember({
+          event: "hybrid-soft-handoff-state",
+          delayMs: 1000,
+          videoId,
+          resumeAt,
+          videoState: summarizeVideoElementState(),
+        });
+      }, 1000);
+
+      setTimeout(() => {
+        remember({
+          event: "hybrid-soft-handoff-state",
+          delayMs: 5000,
+          videoId,
+          resumeAt,
+          videoState: summarizeVideoElementState(),
+        });
+      }, 5000);
+
+      return true;
+    } catch (err) {
+      remember({
+        event: "hybrid-soft-handoff-failed",
+        method: "player-api-object",
+        videoId,
+        resumeAt,
+        error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
+      });
+    }
+
+    try {
+      config.enabled = false;
+
+      player.loadVideoById(videoId, Math.max(0, Number(resumeAt || 0)));
+
+      remember({
+        event: "hybrid-soft-handoff-start",
+        method: "player-api-args",
+        videoId,
+        resumeAt,
+        videoState: summarizeVideoElementState(),
+      });
+
+      setTimeout(() => {
+        remember({
+          event: "hybrid-soft-handoff-state",
+          delayMs: 1000,
+          videoId,
+          resumeAt,
+          videoState: summarizeVideoElementState(),
+        });
+      }, 1000);
+
+      setTimeout(() => {
+        remember({
+          event: "hybrid-soft-handoff-state",
+          delayMs: 5000,
+          videoId,
+          resumeAt,
+          videoState: summarizeVideoElementState(),
+        });
+      }, 5000);
+
+      return true;
+    } catch (err) {
+      remember({
+        event: "hybrid-soft-handoff-failed",
+        method: "player-api-args",
+        videoId,
+        resumeAt,
+        error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
+      });
+    }
+
+    return false;
+  }
+
   function scheduleHybridStartupHandoff(videoId) {
     if (!isHybridStartupMode()) return;
     if (!videoId) return;
@@ -1697,11 +1826,28 @@ yt-source-swap-test.js text/javascript
       });
 
       setTimeout(() => {
-        try {
-          location.replace(targetUrl);
-        } catch {
-          location.href = targetUrl;
+        const method = String(config.hybridStartup?.reloadMethod || "player-api");
+
+        if (method === "player-api") {
+          const softOk = tryHybridPlayerApiHandoff(videoId, resumeAt);
+
+          if (softOk) {
+            return;
+          }
+
+          remember({
+            event: "hybrid-hard-reload-fallback",
+            reason: "player-api-unavailable-or-failed",
+            videoId,
+            resumeAt,
+            targetUrl,
+          });
+
+          hardHybridReload(targetUrl);
+          return;
         }
+
+        hardHybridReload(targetUrl);
       }, 100);
     }, 250);
   }
@@ -2802,6 +2948,7 @@ yt-source-swap-test.js text/javascript
       config.requireNonSabr = true;
       config.hybridStartup.enabled = true;
       config.hybridStartup.handoffAtSeconds = 5;
+      config.hybridStartup.reloadMethod = "player-api";
       config.endpoints.player = false;
       config.endpoints.getWatch = true;
       config.endpoints.next = false;
