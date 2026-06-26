@@ -1338,6 +1338,7 @@ yt-source-swap-test.js text/javascript
       bodyType: meta.bodyType,
       bodyTextLength: meta.bodyTextLength,
       classicPatchMode: config.classicPatchMode,
+      patchPolicy: config.patchPolicy,
       topKeys: meta.bodyJson ? Object.keys(meta.bodyJson).slice(0, 40) : [],
     });
 
@@ -1502,11 +1503,7 @@ yt-source-swap-test.js text/javascript
       return originalResp;
     }
 
-    // Patch only streamingData; do not copy the target playerResponse wholesale.
-    modernPlayer.value.streamingData = cloneJson(targetPlayer.value.streamingData);
-
-    // Strip ad state from the patched modern playerResponse to avoid
-    // inconsistent state: modern ad-eligible object + target non-SABR stream.
+    // Compute modern ad state before mutating streamingData.
     const adStateBeforeStrip = summarizeAdState(modernPlayer.value);
 
     if (
@@ -1541,6 +1538,8 @@ yt-source-swap-test.js text/javascript
       return originalResp;
     }
 
+    // Patch only after policy passes.
+    modernPlayer.value.streamingData = cloneJson(targetPlayer.value.streamingData);
     stripPlayerAdState(modernPlayer.value);
     const adStateAfterStrip = summarizeAdState(modernPlayer.value);
 
@@ -1652,6 +1651,7 @@ yt-source-swap-test.js text/javascript
       requestVideoId: wantedVideoId,
       targetSelectionMode,
       classicPatchMode: config.classicPatchMode,
+      patchPolicy: config.patchPolicy,
       progressiveAutoSelection: targetPlayer.sourceSwapSelection || null,
     };
 
@@ -2152,6 +2152,26 @@ yt-source-swap-test.js text/javascript
         sourceMode: "",
         requestVideoId: "",
       };
+    },
+
+    useAutoFallback() {
+      config.targetProfile = "mweb";
+      config.classicPatchMode = "mweb-progressive-auto";
+      config.patchPolicy = "always";
+      config.endpoints.player = false;
+      config.endpoints.getWatch = true;
+      config.endpoints.next = false;
+      console.log("[yt-source-swap] using mweb-progressive-auto fallback");
+    },
+
+    useAdStateFallback() {
+      config.targetProfile = "mweb";
+      config.classicPatchMode = "mweb-progressive-auto";
+      config.patchPolicy = "ad-state-only";
+      config.endpoints.player = false;
+      config.endpoints.getWatch = true;
+      config.endpoints.next = false;
+      console.log("[yt-source-swap] using ad-state-only mweb fallback");
     },
 
     copyEvents() {
