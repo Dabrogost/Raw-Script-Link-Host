@@ -1691,14 +1691,6 @@ yt-source-swap-test.js text/javascript
       return [false, "hybrid-persisted-bypass-after-handoff"];
     }
 
-    if (isHybridStartupMode()) {
-      const videoId = sourceVideoId;
-
-      if (hasHybridHandoffRecently(videoId)) {
-        return [false, "hybrid-handoff-already-attempted"];
-      }
-    }
-
     return [true, "ok"];
   }
 
