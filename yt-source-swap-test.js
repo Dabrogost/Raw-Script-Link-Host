@@ -3167,6 +3167,18 @@ yt-source-swap-test.js text/javascript
         counters.lastTransport = "xhr";
         counters.lastEndpoint = meta.endpoint || "";
 
+        const warmReplayResp = maybeMakeHybridWarmReplayResponse(meta);
+        if (warmReplayResp) {
+          const responseText = await warmReplayResp.text();
+
+          finishSyntheticXhr(xhr, {
+            json: safeJson(responseText),
+            responseText,
+          }, meta.url);
+
+          return;
+        }
+
         const [shouldAttempt, reason] = shouldAttemptSwap(meta);
 
         if (!shouldAttempt) {
