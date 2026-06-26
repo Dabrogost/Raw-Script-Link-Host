@@ -86,6 +86,8 @@ yt-source-swap-test.js text/javascript
       handoffAtSeconds: 5,
       handoffCooldownMs: 30000,
       reloadMethod: "player-api",
+      autoHandoff: true,
+      warmupMaxWaitMs: 12000,
     },
     endpoints: {
       player: false,
@@ -136,6 +138,10 @@ yt-source-swap-test.js text/javascript
   };
 
   const HYBRID_SESSION_KEY = "__yt_source_swap_hybrid_handoff__";
+
+  const hybridWarmupState = {
+    byVideoId: new Map(),
+  };
 
   function log(...args) {
     if (config.logVerbose) {
@@ -524,6 +530,58 @@ yt-source-swap-test.js text/javascript
 
     headers.set("x-youtube-client-name", profile.clientHeaderName);
     headers.set("x-youtube-client-version", profile.clientVersion);
+
+    if (client.visitorData && !headers.has("x-goog-visitor-id")) {
+      headers.set("x-goog-visitor-id", client.visitorData);
+    }
+
+    if (!headers.has("x-origin")) {
+      headers.set("x-origin", location.origin);
+    }
+
+    return headers;
+  }
+
+  function makeOriginalClientWarmupHeaders(originalHeaders, bodyJson, { gzip }) {
+    const headers = new Headers();
+
+    for (const [key, value] of Object.entries(originalHeaders || {})) {
+      const lower = key.toLowerCase();
+
+      if (
+        lower === "host" ||
+        lower === "cookie" ||
+        lower === "content-length" ||
+        lower === "accept-encoding" ||
+        lower === "referer" ||
+        lower === "origin" ||
+        lower === "connection" ||
+        lower === "user-agent" ||
+        lower.startsWith("sec-")
+      ) {
+        continue;
+      }
+
+      if (lower === "content-encoding") continue;
+
+      try {
+        headers.set(key, value);
+      } catch {}
+    }
+
+    headers.set("content-type", "application/json");
+
+    if (gzip) {
+      headers.set("content-encoding", "gzip");
+    } else {
+      headers.delete("content-encoding");
+    }
+
+    const client = bodyJson?.context?.client || {};
+
+    if (client.clientVersion && !headers.has("x-youtube-client-version")) {
+      headers.set("x-youtube-client-version", client.clientVersion);
+    }
 
     if (client.visitorData && !headers.has("x-goog-visitor-id")) {
       headers.set("x-goog-visitor-id", client.visitorData);
@@ -1746,6 +1804,91 @@ yt-source-swap-test.js text/javascript
     return false;
   }
 
+  function startHybridWebWarmup(meta, videoId) {
+    if (!isHybridStartupMode()) return null;
+    if (!videoId) return null;
+
+    const existing = hybridWarmupState.byVideoId.get(videoId);
+    if (existing) return existing;
+
+    const record = {
+      videoId,
+      startedAt: performance.now(),
+      completedAt: 0,
+      complete: false,
+      ok: false,
+      error: "",
+      results: [],
+    };
+
+    hybridWarmupState.byVideoId.set(videoId, record);
+
+    remember({
+      event: "hybrid-warmup-start",
+      videoId,
+      endpoint: meta.endpoint || endpointForUrl(meta.url),
+      hasPlayerRequest: !!meta.bodyJson?.playerRequest,
+      pageVideoId: getCurrentPageVideoId(),
+      urlVideoId: getCurrentUrlVideoId(),
+      effectiveVideoId: getCurrentEffectiveVideoId(),
+    });
+
+    queueMicrotask(async () => {
+      try {
+        const results = [];
+
+        if (meta.bodyJson?.playerRequest) {
+          const playerBody = buildPlayerReplayFromContainerBody(meta.bodyJson);
+
+          if (playerBody) {
+            const playerWarmup = await fetchOriginalClientWarmupEndpoint(meta, {
+              sourceMode: "web-player-from-container-warmup",
+              url: playerEndpointUrl(),
+              bodyJson: playerBody,
+            });
+
+            results.push(playerWarmup);
+          }
+        } else {
+          const sameEndpointWarmup = await fetchOriginalClientWarmupEndpoint(meta, {
+            sourceMode: "web-same-endpoint-warmup",
+            url: meta.url,
+            bodyJson: meta.bodyJson,
+          });
+
+          results.push(sameEndpointWarmup);
+        }
+
+        record.results = results;
+        record.ok = results.some(result => result.ok);
+        record.complete = true;
+        record.completedAt = performance.now();
+
+        remember({
+          event: "hybrid-warmup-complete",
+          videoId,
+          ok: record.ok,
+          durationMs: Math.round(record.completedAt - record.startedAt),
+          results,
+        });
+      } catch (err) {
+        record.ok = false;
+        record.complete = true;
+        record.completedAt = performance.now();
+        record.error = `${err?.name || "Error"}: ${err?.message || String(err)}`;
+
+        remember({
+          event: "hybrid-warmup-error",
+          videoId,
+          durationMs: Math.round(record.completedAt - record.startedAt),
+          error: record.error,
+        });
+      }
+    });
+
+    return record;
+  }
+
   function scheduleHybridStartupHandoff(videoId) {
     if (!isHybridStartupMode()) return;
     if (!videoId) return;
@@ -1805,6 +1948,68 @@ yt-source-swap-test.js text/javascript
         return;
       }
 
+      const warmup = hybridWarmupState.byVideoId.get(videoId);
+      const warmupAgeMs = warmup
+        ? Math.round(performance.now() - warmup.startedAt)
+        : 0;
+
+      if (!warmup || !warmup.complete) {
+        const maxWaitMs = Number(config.hybridStartup?.warmupMaxWaitMs || 12000);
+
+        if (warmupAgeMs < maxWaitMs) {
+          if (!warmup?.waitingLogged) {
+            if (warmup) warmup.waitingLogged = true;
+
+            remember({
+              event: "hybrid-handoff-waiting-for-warmup",
+              videoId,
+              warmupAgeMs,
+              maxWaitMs,
+              videoState: summarizeVideoElementState(),
+            });
+          }
+
+          return;
+        }
+
+        clearHybridHandoffTimer();
+
+        remember({
+          event: "hybrid-handoff-cancelled",
+          reason: "warmup-timeout",
+          videoId,
+          warmupAgeMs,
+          maxWaitMs,
+          videoState: summarizeVideoElementState(),
+        });
+
+        return;
+      }
+
+      if (!warmup.ok) {
+        clearHybridHandoffTimer();
+
+        remember({
+          event: "hybrid-handoff-cancelled",
+          reason: "warmup-failed",
+          videoId,
+          warmup,
+          videoState: summarizeVideoElementState(),
+        });
+
+        return;
+      }
+
+      remember({
+        event: "hybrid-handoff-warmup-ready",
+        videoId,
+        warmupAgeMs,
+        warmupDurationMs: warmup.completedAt
+          ? Math.round(warmup.completedAt - warmup.startedAt)
+          : null,
+        warmupResults: warmup.results,
+      });
+
       clearHybridHandoffTimer();
 
       hybridState.handoffInProgress = true;
@@ -1850,6 +2055,57 @@ yt-source-swap-test.js text/javascript
         hardHybridReload(targetUrl);
       }, 100);
     }, 250);
+  }
+
+  async function fetchOriginalClientWarmupEndpoint(meta, options = {}) {
+    const targetUrl = options.url || meta.url;
+    const sourceBodyJson = options.bodyJson || meta.bodyJson;
+    const sourceMode = options.sourceMode || "same-endpoint";
+    const bodyText = JSON.stringify(sourceBodyJson);
+
+    let gzip = true;
+    let body = await gzipString(bodyText);
+
+    if (!body) {
+      gzip = false;
+      body = bodyText;
+    }
+
+    const headers = makeOriginalClientWarmupHeaders(meta.rawHeaders, sourceBodyJson, {
+      gzip,
+    });
+
+    const started = performance.now();
+
+    const resp = await nativeFetch(targetUrl, {
+      method: "POST",
+      headers,
+      body,
+      credentials: "include",
+      mode: "same-origin",
+      cache: "no-store",
+      referrer: location.href,
+      referrerPolicy: "strict-origin-when-cross-origin",
+    });
+
+    const text = await resp.text();
+    const json = safeJson(text);
+    const endpointSummary = summarizeEndpointResponse(json);
+
+    return {
+      endpoint: endpointForUrl(targetUrl),
+      sourceMode,
+      httpStatus: resp.status,
+      ok: resp.ok,
+      durationMs: Math.round(performance.now() - started),
+      gzip,
+      summary: endpointSummary.direct,
+      endpointSummary,
+      hasServerAbr: !!endpointSummary?.direct?.hasServerAbr,
+      hasSabr: !!endpointSummary?.direct?.hasSabr,
+      hasStreamingData: !!endpointSummary?.direct?.hasStreamingData,
+      textPreview: json ? "" : text.slice(0, 300),
+    };
   }
 
   function shouldAttemptSwap(meta) {
@@ -2389,10 +2645,20 @@ yt-source-swap-test.js text/javascript
 
     if (
       isHybridStartupMode() &&
+      config.hybridStartup.autoHandoff !== false &&
       config.classicPatchMode === "mweb-progressive-auto" &&
       targetPlayer.acceptedBy === "progressiveAutoOk"
     ) {
-      scheduleHybridStartupHandoff(wantedVideoId || getCurrentPageVideoId());
+      startHybridWebWarmup(meta, wantedVideoId || getCurrentEffectiveVideoId());
+    }
+
+    if (
+      isHybridStartupMode() &&
+      config.hybridStartup.autoHandoff !== false &&
+      config.classicPatchMode === "mweb-progressive-auto" &&
+      targetPlayer.acceptedBy === "progressiveAutoOk"
+    ) {
+      scheduleHybridStartupHandoff(wantedVideoId || getCurrentEffectiveVideoId());
     }
 
     return makeJsonResponseFromOriginal(originalResp, originalJson);
@@ -2898,6 +3164,7 @@ yt-source-swap-test.js text/javascript
       hybridState.handoffInProgress = false;
       hybridState.activeVideoId = "";
       hybridState.activePatchVideoId = "";
+      hybridWarmupState.byVideoId.clear();
     },
 
     useAutoFallback() {
@@ -2948,6 +3215,7 @@ yt-source-swap-test.js text/javascript
       config.requireNonSabr = true;
       config.hybridStartup.enabled = true;
       config.hybridStartup.handoffAtSeconds = 5;
+      config.hybridStartup.autoHandoff = true;
       config.hybridStartup.reloadMethod = "player-api";
       config.endpoints.player = false;
       config.endpoints.getWatch = true;
@@ -2964,11 +3232,57 @@ yt-source-swap-test.js text/javascript
       console.log("[yt-source-swap] hybrid startup disabled");
     },
 
+    useHybridStartupManual() {
+      config.enabled = true;
+      config.targetProfile = "mweb";
+      config.classicPatchMode = "mweb-progressive-auto";
+      config.patchPolicy = "always";
+      config.requireNonSabr = true;
+
+      config.hybridStartup.enabled = true;
+      config.hybridStartup.autoHandoff = false;
+      config.hybridStartup.reloadMethod = "player-api";
+
+      config.endpoints.player = false;
+      config.endpoints.getWatch = true;
+      config.endpoints.next = false;
+
+      hybridState.handoffInProgress = false;
+      clearHybridHandoffTimer();
+
+      console.log("[yt-source-swap] using manual hybrid startup: MWEB fast start, no automatic handoff");
+    },
+
+    handoffNow() {
+      const videoId = getCurrentEffectiveVideoId();
+      const v = document.querySelector("video");
+      const resumeAt = Math.max(0, Number(v?.currentTime || 0) - 0.25);
+
+      if (!videoId) {
+        console.warn("[yt-source-swap] cannot handoff: no video id");
+        return false;
+      }
+
+      persistHybridHandoff(videoId, resumeAt);
+      markHybridHandoffAttempted(videoId);
+      hybridState.handoffInProgress = true;
+
+      remember({
+        event: "hybrid-manual-handoff-start",
+        videoId,
+        resumeAt,
+        videoState: summarizeVideoElementState(),
+      });
+
+      return tryHybridPlayerApiHandoff(videoId, resumeAt);
+    },
+
     clearHybridMemory() {
       hybridState.handoffAttemptedByVideoId.clear();
       hybridState.handoffInProgress = false;
       clearHybridHandoffTimer();
       clearPersistedHybridHandoff();
+      hybridWarmupState.byVideoId.clear();
       console.log("[yt-source-swap] cleared hybrid handoff memory");
     },
 
