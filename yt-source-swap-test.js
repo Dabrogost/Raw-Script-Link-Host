@@ -82,10 +82,9 @@ yt-source-swap-test.js text/javascript
     allowCipherUrlWithoutDecipher: false,
     patchPolicy: "always",
     hybridStartup: {
-      enabled: false,
+      enabled: true,
       handoffAtSeconds: 5,
       handoffCooldownMs: 30000,
-      reloadMethod: "player-api",
       autoHandoff: true,
       warmupMaxWaitMs: 12000,
     },
@@ -141,12 +140,6 @@ yt-source-swap-test.js text/javascript
 
   const hybridWarmupState = {
     byVideoId: new Map(),
-  };
-
-  const hybridReplayState = {
-    activeVideoId: "",
-    expiresAt: 0,
-    responsesByEndpoint: new Map(),
   };
 
   function log(...args) {
@@ -272,64 +265,6 @@ yt-source-swap-test.js text/javascript
       document.querySelector("ytd-player #movie_player") ||
       null
     );
-  }
-
-  function schedulePostPatchPlayerPlay(videoId, reason = "post-container-patch") {
-    const delays = [250, 750, 1500];
-
-    for (const delayMs of delays) {
-      setTimeout(() => {
-        const currentVideoId = getCurrentEffectiveVideoId();
-        if (videoId && currentVideoId && currentVideoId !== videoId) return;
-
-        const player = getMoviePlayer();
-        const v = document.querySelector("video");
-
-        const playerState =
-          player && typeof player.getPlayerState === "function"
-            ? player.getPlayerState()
-            : null;
-
-        remember({
-          event: "post-patch-player-play-check",
-          reason,
-          delayMs,
-          videoId,
-          currentVideoId,
-          playerState,
-          videoState: summarizeVideoElementState(),
-        });
-
-        if (!player || typeof player.playVideo !== "function") return;
-        if (!v) return;
-        if (!v.paused) return;
-        if (v.error) return;
-
-        try {
-          player.playVideo();
-
-          remember({
-            event: "post-patch-player-play-attempt",
-            reason,
-            delayMs,
-            videoId,
-            currentVideoId,
-            playerState,
-            videoState: summarizeVideoElementState(),
-          });
-        } catch (err) {
-          remember({
-            event: "post-patch-player-play-failed",
-            reason,
-            delayMs,
-            videoId,
-            currentVideoId,
-            error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
-            videoState: summarizeVideoElementState(),
-          });
-        }
-      }, delayMs);
-    }
   }
 
   function playerEndpointUrl() {
@@ -990,16 +925,6 @@ yt-source-swap-test.js text/javascript
     };
   }
 
-  function cloneClassicOnlyStreamingData(streamingData) {
-    const clean = cloneJson(streamingData || {});
-
-    delete clean.serverAbrStreamingUrl;
-    delete clean.sabrStreamingUrl;
-    delete clean.serverAbrStreamingUrlConfig;
-
-    return clean;
-  }
-
   function isClassicNonSabrUrl(url) {
     return !!url && !/(?:[?&]|%26)sabr(?:=|%3D)1/i.test(String(url));
   }
@@ -1067,102 +992,6 @@ yt-source-swap-test.js text/javascript
     );
   }
 
-  function isProgressiveFormat(format) {
-    return (
-      format?.itag === 18 ||
-      format?.itag === "18" ||
-      /mp4a/i.test(String(format?.mimeType || "")) ||
-      Array.isArray(format?.audioChannels)
-    );
-  }
-
-  function hasProgressiveRawCipherCandidate(streamingData) {
-    const formats = Array.isArray(streamingData?.formats) ? streamingData.formats : [];
-
-    return formats.some(format =>
-      isProgressiveFormat(format) &&
-      hasRawClassicCipher(format)
-    );
-  }
-
-  function cloneProgressiveOnlyStreamingData(streamingData) {
-    const clean = cloneJson(streamingData || {});
-
-    delete clean.serverAbrStreamingUrl;
-    delete clean.sabrStreamingUrl;
-    delete clean.serverAbrStreamingUrlConfig;
-
-    const formats = Array.isArray(clean.formats) ? clean.formats : [];
-    clean.formats = formats.filter(hasDirectClassicUrl);
-
-    clean.adaptiveFormats = [];
-
-    return clean;
-  }
-
-  function cloneProgressiveCipherUrlOnlyStreamingData(streamingData) {
-    const clean = cloneJson(streamingData || {});
-
-    delete clean.serverAbrStreamingUrl;
-    delete clean.sabrStreamingUrl;
-    delete clean.serverAbrStreamingUrlConfig;
-
-    const formats = Array.isArray(clean.formats) ? clean.formats : [];
-
-    clean.formats = formats
-      .map(format => {
-        if (format.url && hasDirectClassicUrl(format)) {
-          return format;
-        }
-
-        const cipher = format.signatureCipher || format.cipher || "";
-        const parsed = parseCipherString(cipher);
-
-        if (!parsed.url) return null;
-
-        const sigValue = parsed.sig || parsed.signature || "";
-        const sigParam = parsed.sp || "signature";
-
-        if (!sigValue) return null;
-
-        const url = new URL(parsed.url);
-
-        url.searchParams.set(sigParam, sigValue);
-
-        const cloned = cloneJson(format);
-        cloned.url = url.toString();
-        delete cloned.signatureCipher;
-        delete cloned.cipher;
-        return cloned;
-      })
-      .filter(Boolean);
-
-    clean.adaptiveFormats = [];
-
-    return clean;
-  }
-
-  function cloneProgressiveRawCipherStreamingData(streamingData) {
-    const clean = cloneJson(streamingData || {});
-
-    delete clean.serverAbrStreamingUrl;
-    delete clean.sabrStreamingUrl;
-    delete clean.serverAbrStreamingUrlConfig;
-
-    const formats = Array.isArray(clean.formats) ? clean.formats : [];
-
-    clean.formats = formats
-      .filter(format =>
-        isProgressiveFormat(format) &&
-        hasDirectClassicUrlOrCipher(format)
-      )
-      .map(format => cloneJson(format));
-
-    clean.adaptiveFormats = [];
-
-    return clean;
-  }
-
   function cloneMwebProgressiveAutoStreamingData(streamingData) {
     const clean = cloneJson(streamingData || {});
 
@@ -1202,41 +1031,14 @@ yt-source-swap-test.js text/javascript
     const cloned = cloneJson(basePlayer || {});
     let sourceSwapSelection = null;
 
-    if (config.classicPatchMode === "mweb-progressive-auto") {
-      const result = cloneMwebProgressiveAutoStreamingData(streamingData);
-      cloned.streamingData = result.streamingData;
-      sourceSwapSelection = result.selection;
-    } else if (config.classicPatchMode === "progressive-only") {
-      cloned.streamingData = cloneProgressiveOnlyStreamingData(streamingData);
-    } else if (config.classicPatchMode === "progressive-cipher-url-only") {
-      cloned.streamingData = cloneProgressiveCipherUrlOnlyStreamingData(streamingData);
-    } else if (config.classicPatchMode === "progressive-raw-cipher") {
-      cloned.streamingData = cloneProgressiveRawCipherStreamingData(streamingData);
-    } else if (config.classicPatchMode === "webcreator-adaptive-classic-auto") {
-      const result = cloneAdaptiveClassicStreamingData(streamingData);
-      cloned.streamingData = result.streamingData;
-      sourceSwapSelection = result.adaptiveClassicSelection;
-    } else if (config.classicPatchMode === "webcreator-adaptive-classic-full") {
-      const result = cloneWebCreatorClassicFullStreamingData(streamingData);
-      cloned.streamingData = result.streamingData;
-      sourceSwapSelection = result.adaptiveClassicSelection;
-    } else {
-      cloned.streamingData = cloneClassicOnlyStreamingData(streamingData);
-    }
+    const result = cloneMwebProgressiveAutoStreamingData(streamingData);
+    cloned.streamingData = result.streamingData;
+    sourceSwapSelection = result.selection;
 
     return {
       player: cloned,
       sourceSwapSelection,
     };
-  }
-
-  function hasPlayableProgressiveCandidate(streamingData) {
-    const formats = Array.isArray(streamingData?.formats) ? streamingData.formats : [];
-
-    return formats.some(format =>
-      isProgressiveFormat(format) &&
-      hasDirectClassicUrlOrCipher(format)
-    );
   }
 
   function hasSelectedProgressiveItag18(streamingData) {
@@ -1249,249 +1051,6 @@ yt-source-swap-test.js text/javascript
         return kind === "direct-url" || kind === "raw-cipher";
       })
     );
-  }
-
-  function getFormatUrlMode(format) {
-    if (hasDirectClassicUrl(format)) return "direct-url";
-    if (hasRawClassicCipher(format)) return "raw-cipher";
-    return "";
-  }
-
-  function isUsableClassicFormat(format) {
-    return !!getFormatUrlMode(format);
-  }
-
-  function isVideoFormat(format) {
-    return String(format?.mimeType || "").includes("video/");
-  }
-
-  function isAudioFormat(format) {
-    return String(format?.mimeType || "").includes("audio/");
-  }
-
-  function getFormatHeight(format) {
-    return Number(format?.height || 0);
-  }
-
-  function getFormatBitrate(format) {
-    return Number(format?.bitrate || format?.averageBitrate || 0);
-  }
-
-  function hasUsableAdaptiveClassicPair(streamingData) {
-    const adaptiveFormats = Array.isArray(streamingData?.adaptiveFormats)
-      ? streamingData.adaptiveFormats
-      : [];
-
-    const hasVideo = adaptiveFormats.some(format =>
-      isVideoFormat(format) &&
-      isUsableClassicFormat(format)
-    );
-
-    const hasAudio = adaptiveFormats.some(format =>
-      isAudioFormat(format) &&
-      isUsableClassicFormat(format)
-    );
-
-    return hasVideo && hasAudio;
-  }
-
-  function pickBestAdaptiveClassicPair(streamingData) {
-    const adaptiveFormats = Array.isArray(streamingData?.adaptiveFormats)
-      ? streamingData.adaptiveFormats
-      : [];
-
-    const videos = adaptiveFormats
-      .filter(format =>
-        isVideoFormat(format) &&
-        isUsableClassicFormat(format)
-      )
-      .sort((a, b) => {
-        const heightDelta = getFormatHeight(b) - getFormatHeight(a);
-        if (heightDelta) return heightDelta;
-        return getFormatBitrate(b) - getFormatBitrate(a);
-      });
-
-    const audios = adaptiveFormats
-      .filter(format =>
-        isAudioFormat(format) &&
-        isUsableClassicFormat(format)
-      )
-      .sort((a, b) => getFormatBitrate(b) - getFormatBitrate(a));
-
-    return {
-      video: videos[0] || null,
-      audio: audios[0] || null,
-      videoCount: videos.length,
-      audioCount: audios.length,
-    };
-  }
-
-  function summarizeAdaptiveClassicPair(pair) {
-    function summarize(format) {
-      if (!format) return null;
-
-      const cipher = getCipherString(format);
-      const parsedCipher = parseCipherString(cipher);
-      const rawUrl = format?.url || parsedCipher.url || "";
-      let urlInfo = null;
-
-      try {
-        if (rawUrl) {
-          const u = new URL(rawUrl);
-          urlInfo = {
-            host: u.hostname,
-            itag: u.searchParams.get("itag") || "",
-            mime: u.searchParams.get("mime") || "",
-            c: u.searchParams.get("c") || "",
-            hasSabr: /(?:[?&]|%26)sabr(?:=|%3D)1/i.test(rawUrl),
-            urlStart: rawUrl.slice(0, 260),
-          };
-        }
-      } catch {}
-
-      return {
-        itag: format?.itag || "",
-        mimeType: format?.mimeType || "",
-        quality: format?.quality || "",
-        qualityLabel: format?.qualityLabel || "",
-        height: getFormatHeight(format),
-        bitrate: getFormatBitrate(format),
-        audioQuality: format?.audioQuality || "",
-        audioSampleRate: format?.audioSampleRate || "",
-        audioChannels: format?.audioChannels || null,
-        mode: getFormatUrlMode(format),
-        hasUrl: !!format?.url,
-        hasSignatureCipher: !!format?.signatureCipher,
-        hasCipher: !!format?.cipher,
-        urlInfo,
-      };
-    }
-
-    return {
-      videoCount: pair?.videoCount || 0,
-      audioCount: pair?.audioCount || 0,
-      video: summarize(pair?.video),
-      audio: summarize(pair?.audio),
-      hasPair: !!pair?.video && !!pair?.audio,
-    };
-  }
-
-  function hasSelectedAdaptiveClassicPair(streamingData) {
-    const formats = Array.isArray(streamingData?.formats) ? streamingData.formats : [];
-    const adaptiveFormats = Array.isArray(streamingData?.adaptiveFormats)
-      ? streamingData.adaptiveFormats
-      : [];
-
-    if (config.classicPatchMode === "webcreator-adaptive-classic-auto") {
-      if (formats.length !== 0) return false;
-      if (adaptiveFormats.length !== 2) return false;
-    }
-
-    if (config.classicPatchMode === "webcreator-adaptive-classic-full") {
-      if (adaptiveFormats.length < 2) return false;
-    }
-
-    const hasVideo = adaptiveFormats.some(format =>
-      isVideoFormat(format) &&
-      isUsableClassicFormat(format)
-    );
-
-    const hasAudio = adaptiveFormats.some(format =>
-      isAudioFormat(format) &&
-      isUsableClassicFormat(format)
-    );
-
-    return hasVideo && hasAudio;
-  }
-
-  function cloneAdaptiveClassicStreamingData(streamingData) {
-    const clean = cloneJson(streamingData || {});
-
-    delete clean.serverAbrStreamingUrl;
-    delete clean.sabrStreamingUrl;
-    delete clean.serverAbrStreamingUrlConfig;
-
-    const pair = pickBestAdaptiveClassicPair(clean);
-
-    clean.formats = [];
-    clean.adaptiveFormats = pair.video && pair.audio
-      ? [cloneJson(pair.video), cloneJson(pair.audio)]
-      : [];
-
-    return {
-      streamingData: clean,
-      adaptiveClassicSelection: summarizeAdaptiveClassicPair(pair),
-    };
-  }
-
-  function summarizeWebCreatorClassicFull(streamingData) {
-    const formats = Array.isArray(streamingData?.formats) ? streamingData.formats : [];
-    const adaptiveFormats = Array.isArray(streamingData?.adaptiveFormats)
-      ? streamingData.adaptiveFormats
-      : [];
-
-    const videos = adaptiveFormats
-      .filter(format => isVideoFormat(format) && isUsableClassicFormat(format))
-      .sort((a, b) => {
-        const heightDelta = getFormatHeight(b) - getFormatHeight(a);
-        if (heightDelta) return heightDelta;
-        return getFormatBitrate(b) - getFormatBitrate(a);
-      });
-
-    const audios = adaptiveFormats
-      .filter(format => isAudioFormat(format) && isUsableClassicFormat(format))
-      .sort((a, b) => getFormatBitrate(b) - getFormatBitrate(a));
-
-    return {
-      mode: "webcreator-adaptive-classic-full",
-      progressiveCount: formats.length,
-      adaptiveCount: adaptiveFormats.length,
-      adaptiveVideoCount: videos.length,
-      adaptiveAudioCount: audios.length,
-      hasPair: !!videos.length && !!audios.length,
-      bestVideo: videos[0]
-        ? {
-            itag: videos[0].itag || "",
-            mimeType: videos[0].mimeType || "",
-            qualityLabel: videos[0].qualityLabel || "",
-            height: getFormatHeight(videos[0]),
-            bitrate: getFormatBitrate(videos[0]),
-            mode: getFormatUrlMode(videos[0]),
-          }
-        : null,
-      bestAudio: audios[0]
-        ? {
-            itag: audios[0].itag || "",
-            mimeType: audios[0].mimeType || "",
-            bitrate: getFormatBitrate(audios[0]),
-            mode: getFormatUrlMode(audios[0]),
-          }
-        : null,
-    };
-  }
-
-  function cloneWebCreatorClassicFullStreamingData(streamingData) {
-    const clean = cloneJson(streamingData || {});
-
-    delete clean.serverAbrStreamingUrl;
-    delete clean.sabrStreamingUrl;
-    delete clean.serverAbrStreamingUrlConfig;
-
-    const formats = Array.isArray(clean.formats) ? clean.formats : [];
-    const adaptiveFormats = Array.isArray(clean.adaptiveFormats) ? clean.adaptiveFormats : [];
-
-    clean.formats = formats
-      .filter(format => isUsableClassicFormat(format))
-      .map(format => cloneJson(format));
-
-    clean.adaptiveFormats = adaptiveFormats
-      .filter(format => isUsableClassicFormat(format))
-      .map(format => cloneJson(format));
-
-    return {
-      streamingData: clean,
-      adaptiveClassicSelection: summarizeWebCreatorClassicFull(clean),
-    };
   }
 
   function hasMeaningfulAdState(adState) {
@@ -1521,24 +1080,9 @@ yt-source-swap-test.js text/javascript
 
       const details = summarizeStreamingDataUrls(streamingData);
 
-      const canUseDirectClassic = details.hasAnyClassicUrl;
+      const canUseAuto = hasMwebProgressiveAutoCandidate(streamingData);
 
-      const canUseRawCipher =
-        config.classicPatchMode === "progressive-raw-cipher" &&
-        hasProgressiveRawCipherCandidate(streamingData);
-
-      const canUseAuto =
-        config.classicPatchMode === "mweb-progressive-auto" &&
-        hasMwebProgressiveAutoCandidate(streamingData);
-
-      const canUseAdaptiveClassic =
-        (
-          config.classicPatchMode === "webcreator-adaptive-classic-auto" ||
-          config.classicPatchMode === "webcreator-adaptive-classic-full"
-        ) &&
-        hasUsableAdaptiveClassicPair(streamingData);
-
-      if (!canUseDirectClassic && !canUseRawCipher && !canUseAuto && !canUseAdaptiveClassic) {
+      if (!details.hasAnyClassicUrl && !canUseAuto) {
         continue;
       }
 
@@ -1549,40 +1093,18 @@ yt-source-swap-test.js text/javascript
 
       const baseUsable = playerSummaryIsUsable(summary);
 
-      const progressiveRawCipherOk =
-        config.classicPatchMode === "progressive-raw-cipher" &&
-        summary.status === "OK" &&
-        !summary.hasSabr &&
-        !summary.hasServerAbr &&
-        hasPlayableProgressiveCandidate(synthetic.streamingData);
-
       const progressiveAutoOk =
-        config.classicPatchMode === "mweb-progressive-auto" &&
         summary.status === "OK" &&
         !summary.hasSabr &&
         !summary.hasServerAbr &&
         hasPatchedProgressiveAutoCandidate(synthetic.streamingData);
 
-      const adaptiveClassicOk =
-        (
-          config.classicPatchMode === "webcreator-adaptive-classic-auto" ||
-          config.classicPatchMode === "webcreator-adaptive-classic-full"
-        ) &&
-        summary.status === "OK" &&
-        !summary.hasSabr &&
-        !summary.hasServerAbr &&
-        hasSelectedAdaptiveClassicPair(synthetic.streamingData);
-
       const acceptedBy =
-        adaptiveClassicOk
-          ? "adaptiveClassicOk"
-          : progressiveAutoOk
-            ? "progressiveAutoOk"
-            : progressiveRawCipherOk
-              ? "progressiveRawCipherOk"
-              : baseUsable
-                ? "playerSummaryIsUsable"
-                : "";
+        progressiveAutoOk
+          ? "progressiveAutoOk"
+          : baseUsable
+            ? "playerSummaryIsUsable"
+            : "";
 
       if (acceptedBy) {
         return {
@@ -1591,7 +1113,7 @@ yt-source-swap-test.js text/javascript
           summary,
           originalSummary: match.summary,
           streamingDetails: details,
-          mode: config.classicPatchMode,
+          mode: "mweb-progressive-auto",
           acceptedBy,
           sourceSwapSelection,
         };
@@ -1602,25 +1124,6 @@ yt-source-swap-test.js text/javascript
   }
 
   function selectTargetPlayerForCurrentMode(root, wantedVideoId = "") {
-    if (
-      config.classicPatchMode === "webcreator-adaptive-classic-auto" ||
-      config.classicPatchMode === "webcreator-adaptive-classic-full"
-    ) {
-      const adaptiveClassicTarget = findClassicOnlyCandidateForVideo(root, wantedVideoId);
-
-      if (adaptiveClassicTarget) {
-        return {
-          targetPlayer: adaptiveClassicTarget,
-          targetSelectionMode: adaptiveClassicTarget.mode,
-        };
-      }
-
-      return {
-        targetPlayer: null,
-        targetSelectionMode: "webcreator-adaptive-classic-missing",
-      };
-    }
-
     let targetPlayer = findBestUsablePlayerObjectForVideo(root, wantedVideoId);
     let targetSelectionMode = "direct-usable";
 
@@ -1777,148 +1280,6 @@ yt-source-swap-test.js text/javascript
     }
   }
 
-  function hardHybridReload(targetUrl) {
-    try {
-      location.replace(targetUrl);
-    } catch {
-      location.href = targetUrl;
-    }
-  }
-
-  function tryHybridPlayerApiHandoff(videoId, resumeAt) {
-    const player = getMoviePlayer();
-
-    if (!player || typeof player.loadVideoById !== "function") {
-      return false;
-    }
-
-    try {
-      remember({
-        event: "hybrid-soft-handoff-attempt",
-        method: "player-api",
-        videoId,
-        resumeAt,
-        hasLoadVideoById: typeof player.loadVideoById === "function",
-        hasLoadVideoByPlayerVars: typeof player.loadVideoByPlayerVars === "function",
-        hasCueVideoById: typeof player.cueVideoById === "function",
-        videoState: summarizeVideoElementState(),
-      });
-
-      player.loadVideoById({
-        videoId,
-        startSeconds: Math.max(0, Number(resumeAt || 0)),
-      });
-
-      remember({
-        event: "hybrid-soft-handoff-start",
-        method: "player-api",
-        videoId,
-        resumeAt,
-        videoState: summarizeVideoElementState(),
-      });
-
-      setTimeout(() => {
-        remember({
-          event: "hybrid-soft-handoff-state",
-          delayMs: 1000,
-          videoId,
-          resumeAt,
-          videoState: summarizeVideoElementState(),
-        });
-      }, 1000);
-
-      setTimeout(() => {
-        remember({
-          event: "hybrid-soft-handoff-state",
-          delayMs: 5000,
-          videoId,
-          resumeAt,
-          videoState: summarizeVideoElementState(),
-        });
-      }, 5000);
-
-      setTimeout(() => {
-        config.enabled = false;
-        hybridReplayState.activeVideoId = "";
-        hybridReplayState.responsesByEndpoint.clear();
-
-        remember({
-          event: "hybrid-warm-replay-closed",
-          videoId,
-          reason: "post-handoff-timeout",
-          videoState: summarizeVideoElementState(),
-        });
-      }, 4000);
-
-      return true;
-    } catch (err) {
-      remember({
-        event: "hybrid-soft-handoff-failed",
-        method: "player-api-object",
-        videoId,
-        resumeAt,
-        error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
-      });
-    }
-
-    try {
-      player.loadVideoById(videoId, Math.max(0, Number(resumeAt || 0)));
-
-      remember({
-        event: "hybrid-soft-handoff-start",
-        method: "player-api-args",
-        videoId,
-        resumeAt,
-        videoState: summarizeVideoElementState(),
-      });
-
-      setTimeout(() => {
-        remember({
-          event: "hybrid-soft-handoff-state",
-          delayMs: 1000,
-          videoId,
-          resumeAt,
-          videoState: summarizeVideoElementState(),
-        });
-      }, 1000);
-
-      setTimeout(() => {
-        remember({
-          event: "hybrid-soft-handoff-state",
-          delayMs: 5000,
-          videoId,
-          resumeAt,
-          videoState: summarizeVideoElementState(),
-        });
-      }, 5000);
-
-      setTimeout(() => {
-        config.enabled = false;
-        hybridReplayState.activeVideoId = "";
-        hybridReplayState.responsesByEndpoint.clear();
-
-        remember({
-          event: "hybrid-warm-replay-closed",
-          videoId,
-          reason: "post-handoff-timeout",
-          videoState: summarizeVideoElementState(),
-        });
-      }, 4000);
-
-      return true;
-    } catch (err) {
-      remember({
-        event: "hybrid-soft-handoff-failed",
-        method: "player-api-args",
-        videoId,
-        resumeAt,
-        error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
-      });
-    }
-
-    return false;
-  }
-
   function startHybridWebWarmup(meta, videoId) {
     if (!isHybridStartupMode()) return null;
     if (!videoId) return null;
@@ -2016,81 +1377,6 @@ yt-source-swap-test.js text/javascript
     });
 
     return record;
-  }
-
-  function armHybridWarmReplay(videoId, warmup) {
-    hybridReplayState.activeVideoId = videoId;
-    hybridReplayState.expiresAt = performance.now() + 10000;
-    hybridReplayState.responsesByEndpoint.clear();
-
-    for (const result of warmup?.results || []) {
-      if (!result?.ok || !result?.json) continue;
-
-      const endpoint = result.endpoint || "";
-      if (!endpoint) continue;
-
-      hybridReplayState.responsesByEndpoint.set(endpoint, {
-        endpoint,
-        sourceMode: result.sourceMode || "",
-        httpStatus: result.httpStatus || 200,
-        statusText: result.statusText || "OK",
-        json: result.json,
-        responseText: result.responseText || JSON.stringify(result.json),
-        durationMs: result.durationMs || 0,
-      });
-    }
-
-    remember({
-      event: "hybrid-warm-replay-armed",
-      videoId,
-      endpoints: [...hybridReplayState.responsesByEndpoint.keys()],
-      expiresInMs: Math.round(hybridReplayState.expiresAt - performance.now()),
-    });
-  }
-
-  function maybeMakeHybridWarmReplayResponse(meta) {
-    const endpoint = meta.endpoint || endpointForUrl(meta.url);
-    const now = performance.now();
-
-    if (!hybridReplayState.activeVideoId) return null;
-
-    if (now > hybridReplayState.expiresAt) {
-      hybridReplayState.activeVideoId = "";
-      hybridReplayState.responsesByEndpoint.clear();
-      return null;
-    }
-
-    const requestVideoId = getBodyVideoId(meta.bodyJson) || getCurrentEffectiveVideoId();
-
-    if (
-      hybridReplayState.activeVideoId &&
-      requestVideoId &&
-      requestVideoId !== hybridReplayState.activeVideoId
-    ) {
-      return null;
-    }
-
-    const cached = hybridReplayState.responsesByEndpoint.get(endpoint);
-    if (!cached) return null;
-
-    remember({
-      event: "hybrid-warm-replay-hit",
-      endpoint,
-      videoId: hybridReplayState.activeVideoId,
-      requestVideoId,
-      sourceMode: cached.sourceMode,
-      originalDurationMs: cached.durationMs,
-      transport: meta.transport,
-    });
-
-    return new Response(cached.responseText, {
-      status: cached.httpStatus,
-      statusText: cached.statusText,
-      headers: {
-        "content-type": "application/json; charset=utf-8",
-        "x-yt-source-swap-warm-replay": endpoint,
-      },
-    });
   }
 
   function scheduleHybridStartupHandoff(videoId) {
@@ -2219,47 +1505,19 @@ yt-source-swap-test.js text/javascript
       hybridState.handoffInProgress = true;
       markHybridHandoffAttempted(videoId);
 
-      const resumeAt = Math.max(0, currentTime - 0.25);
-      const targetUrl = getWatchUrlWithTimestamp(videoId, resumeAt);
-
-      persistHybridHandoff(videoId, resumeAt);
-
-      armHybridWarmReplay(videoId, warmup);
-
-      config.enabled = true;
-
       remember({
-        event: "hybrid-handoff-start",
+        event: "web-warmup-ready",
         videoId,
-        resumeAt,
-        targetUrl,
+        warmupResults: warmup.results,
         videoState: summarizeVideoElementState(),
       });
 
-      setTimeout(() => {
-        const method = String(config.hybridStartup?.reloadMethod || "player-api");
-
-        if (method === "player-api") {
-          const softOk = tryHybridPlayerApiHandoff(videoId, resumeAt);
-
-          if (softOk) {
-            return;
-          }
-
-          remember({
-            event: "hybrid-hard-reload-fallback",
-            reason: "player-api-unavailable-or-failed",
-            videoId,
-            resumeAt,
-            targetUrl,
-          });
-
-          hardHybridReload(targetUrl);
-          return;
-        }
-
-        hardHybridReload(targetUrl);
-      }, 100);
+      remember({
+        event: "source-swap-not-attempted",
+        reason: "no-true-seamless-swap-implemented",
+        videoId,
+        videoState: summarizeVideoElementState(),
+      });
     }, 250);
   }
 
@@ -2634,12 +1892,6 @@ yt-source-swap-test.js text/javascript
         modernPath: modernPlayer?.path || "",
         targetSelectionMode,
         classicPatchMode: config.classicPatchMode,
-        lastTargetHadRawCipherCandidate: lastTargetPlayer
-          ? hasProgressiveRawCipherCandidate(lastTargetPlayer.value?.streamingData)
-          : false,
-        lastTargetHadPlayableProgressiveCandidate: lastTargetPlayer
-          ? hasPlayableProgressiveCandidate(lastTargetPlayer.value?.streamingData)
-          : false,
       });
 
       return originalResp;
@@ -2688,28 +1940,12 @@ yt-source-swap-test.js text/javascript
     const patchedSummary = summarizePlayerResponse(modernPlayer.value);
 
     const patchedProgressiveFallbackOk =
-      (
-        config.classicPatchMode === "mweb-progressive-auto" ||
-        config.classicPatchMode === "progressive-raw-cipher" ||
-        config.classicPatchMode === "progressive-only"
-      ) &&
       patchedSummary.status === "OK" &&
       !patchedSummary.hasSabr &&
       !patchedSummary.hasServerAbr &&
       hasSelectedProgressiveItag18(modernPlayer.value.streamingData);
 
-    const patchedAdaptiveClassicOk =
-      (
-        config.classicPatchMode === "webcreator-adaptive-classic-auto" ||
-        config.classicPatchMode === "webcreator-adaptive-classic-full"
-      ) &&
-      patchedSummary.status === "OK" &&
-      !patchedSummary.hasSabr &&
-      !patchedSummary.hasServerAbr &&
-      hasSelectedAdaptiveClassicPair(modernPlayer.value.streamingData);
-
     const patchedUsable =
-      patchedAdaptiveClassicOk ||
       patchedProgressiveFallbackOk ||
       playerSummaryIsUsable(patchedSummary);
 
@@ -2750,12 +1986,6 @@ yt-source-swap-test.js text/javascript
         patchedSummary,
         targetSelectionMode,
         classicPatchMode: config.classicPatchMode,
-        lastTargetHadRawCipherCandidate: lastTargetPlayer
-          ? hasProgressiveRawCipherCandidate(lastTargetPlayer.value?.streamingData)
-          : false,
-        lastTargetHadPlayableProgressiveCandidate: lastTargetPlayer
-          ? hasPlayableProgressiveCandidate(lastTargetPlayer.value?.streamingData)
-          : false,
       });
 
       return originalResp;
@@ -2791,21 +2021,9 @@ yt-source-swap-test.js text/javascript
       adStateBeforeStrip,
       adStateAfterStrip,
       classicPatchMode: config.classicPatchMode,
-      progressiveAutoSelection: config.classicPatchMode === "mweb-progressive-auto"
-        ? targetPlayer.sourceSwapSelection || null
-        : null,
-      adaptiveClassicSelection: (
-        config.classicPatchMode === "webcreator-adaptive-classic-auto" ||
-        config.classicPatchMode === "webcreator-adaptive-classic-full"
-      )
-        ? targetPlayer.sourceSwapSelection || null
-        : null,
-      rawCipherCandidate: hasProgressiveRawCipherCandidate(targetPlayer.value.streamingData),
-      playableProgressiveCandidate: hasPlayableProgressiveCandidate(targetPlayer.value.streamingData),
+      progressiveAutoSelection: targetPlayer.sourceSwapSelection || null,
       acceptedBy: targetPlayer.acceptedBy || "",
     });
-
-    schedulePostPatchPlayerPlay(wantedVideoId || getCurrentEffectiveVideoId());
 
     lastPatch = {
       time: performance.now(),
@@ -2815,15 +2033,7 @@ yt-source-swap-test.js text/javascript
       targetSelectionMode,
       classicPatchMode: config.classicPatchMode,
       patchPolicy: config.patchPolicy,
-      progressiveAutoSelection: config.classicPatchMode === "mweb-progressive-auto"
-        ? targetPlayer.sourceSwapSelection || null
-        : null,
-      adaptiveClassicSelection: (
-        config.classicPatchMode === "webcreator-adaptive-classic-auto" ||
-        config.classicPatchMode === "webcreator-adaptive-classic-full"
-      )
-        ? targetPlayer.sourceSwapSelection || null
-        : null,
+      progressiveAutoSelection: targetPlayer.sourceSwapSelection || null,
     };
 
     const patchSnapshot = cloneJson(lastPatch);
@@ -3049,11 +2259,6 @@ yt-source-swap-test.js text/javascript
 
       meta = await readFetchMeta(input, init);
 
-      const warmReplayResp = maybeMakeHybridWarmReplayResponse(meta);
-      if (warmReplayResp) {
-        return warmReplayResp;
-      }
-
       counters.seen++;
       counters.seenFetch++;
       counters.lastTransport = "fetch";
@@ -3227,18 +2432,6 @@ yt-source-swap-test.js text/javascript
         counters.lastTransport = "xhr";
         counters.lastEndpoint = meta.endpoint || "";
 
-        const warmReplayResp = maybeMakeHybridWarmReplayResponse(meta);
-        if (warmReplayResp) {
-          const responseText = await warmReplayResp.text();
-
-          finishSyntheticXhr(xhr, {
-            json: safeJson(responseText),
-            responseText,
-          }, meta.url);
-
-          return;
-        }
-
         const [shouldAttempt, reason] = shouldAttemptSwap(meta);
 
         if (!shouldAttempt) {
@@ -3342,33 +2535,12 @@ yt-source-swap-test.js text/javascript
     counters,
     events,
 
-    setProfile(key) {
-      if (!CLIENT_PROFILES[key]) {
-        console.warn("[yt-source-swap] unknown profile", key, Object.keys(CLIENT_PROFILES));
-        return false;
-      }
-
-      config.targetProfile = key;
-      console.log("[yt-source-swap] target profile set", key, CLIENT_PROFILES[key]);
-      return true;
-    },
-
     stats() {
       return {
         config: { ...config, endpoints: { ...config.endpoints } },
         counters: { ...counters },
         lastEvent: events[events.length - 1] || null,
       };
-    },
-
-    enable() {
-      config.enabled = true;
-      console.log("[yt-source-swap] enabled");
-    },
-
-    disable() {
-      config.enabled = false;
-      console.log("[yt-source-swap] disabled");
     },
 
     clear() {
@@ -3393,119 +2565,6 @@ yt-source-swap-test.js text/javascript
       hybridState.activeVideoId = "";
       hybridState.activePatchVideoId = "";
       hybridWarmupState.byVideoId.clear();
-      hybridReplayState.activeVideoId = "";
-      hybridReplayState.expiresAt = 0;
-      hybridReplayState.responsesByEndpoint.clear();
-    },
-
-    useAutoFallback() {
-      config.targetProfile = "mweb";
-      config.classicPatchMode = "mweb-progressive-auto";
-      config.patchPolicy = "always";
-      config.endpoints.player = false;
-      config.endpoints.getWatch = true;
-      config.endpoints.next = false;
-      console.log("[yt-source-swap] using mweb-progressive-auto fallback");
-    },
-
-    useAdStateFallback() {
-      config.targetProfile = "mweb";
-      config.classicPatchMode = "mweb-progressive-auto";
-      config.patchPolicy = "ad-state-only";
-      config.endpoints.player = false;
-      config.endpoints.getWatch = true;
-      config.endpoints.next = false;
-      console.log("[yt-source-swap] using ad-state-only mweb fallback");
-    },
-
-    useWebCreatorAdaptive() {
-      config.targetProfile = "webCreator";
-      config.classicPatchMode = "webcreator-adaptive-classic-auto";
-      config.patchPolicy = "always";
-      config.endpoints.player = false;
-      config.endpoints.getWatch = true;
-      config.endpoints.next = false;
-      console.log("[yt-source-swap] using WEB_CREATOR adaptive classic fallback");
-    },
-
-    useWebCreatorAdaptiveFull() {
-      config.targetProfile = "webCreator";
-      config.classicPatchMode = "webcreator-adaptive-classic-full";
-      config.patchPolicy = "always";
-      config.endpoints.player = false;
-      config.endpoints.getWatch = true;
-      config.endpoints.next = false;
-      console.log("[yt-source-swap] using WEB_CREATOR full adaptive classic fallback");
-    },
-
-    useHybridStartup() {
-      config.enabled = true;
-      config.targetProfile = "mweb";
-      config.classicPatchMode = "mweb-progressive-auto";
-      config.patchPolicy = "always";
-      config.requireNonSabr = true;
-      config.hybridStartup.enabled = true;
-      config.hybridStartup.handoffAtSeconds = 5;
-      config.hybridStartup.autoHandoff = true;
-      config.hybridStartup.reloadMethod = "player-api";
-      config.endpoints.player = false;
-      config.endpoints.getWatch = true;
-      config.endpoints.next = false;
-      hybridState.handoffInProgress = false;
-      clearHybridHandoffTimer();
-      console.log("[yt-source-swap] using hybrid startup: MWEB fast start then WEB handoff");
-    },
-
-    disableHybridStartup() {
-      config.hybridStartup.enabled = false;
-      hybridState.handoffInProgress = false;
-      clearHybridHandoffTimer();
-      console.log("[yt-source-swap] hybrid startup disabled");
-    },
-
-    useHybridStartupManual() {
-      config.enabled = true;
-      config.targetProfile = "mweb";
-      config.classicPatchMode = "mweb-progressive-auto";
-      config.patchPolicy = "always";
-      config.requireNonSabr = true;
-
-      config.hybridStartup.enabled = true;
-      config.hybridStartup.autoHandoff = false;
-      config.hybridStartup.reloadMethod = "player-api";
-
-      config.endpoints.player = false;
-      config.endpoints.getWatch = true;
-      config.endpoints.next = false;
-
-      hybridState.handoffInProgress = false;
-      clearHybridHandoffTimer();
-
-      console.log("[yt-source-swap] using manual hybrid startup: MWEB fast start, no automatic handoff");
-    },
-
-    handoffNow() {
-      const videoId = getCurrentEffectiveVideoId();
-      const v = document.querySelector("video");
-      const resumeAt = Math.max(0, Number(v?.currentTime || 0) - 0.25);
-
-      if (!videoId) {
-        console.warn("[yt-source-swap] cannot handoff: no video id");
-        return false;
-      }
-
-      persistHybridHandoff(videoId, resumeAt);
-      markHybridHandoffAttempted(videoId);
-      hybridState.handoffInProgress = true;
-
-      remember({
-        event: "hybrid-manual-handoff-start",
-        videoId,
-        resumeAt,
-        videoState: summarizeVideoElementState(),
-      });
-
-      return tryHybridPlayerApiHandoff(videoId, resumeAt);
     },
 
     clearHybridMemory() {
@@ -3514,9 +2573,6 @@ yt-source-swap-test.js text/javascript
       clearHybridHandoffTimer();
       clearPersistedHybridHandoff();
       hybridWarmupState.byVideoId.clear();
-      hybridReplayState.activeVideoId = "";
-      hybridReplayState.expiresAt = 0;
-      hybridReplayState.responsesByEndpoint.clear();
       console.log("[yt-source-swap] cleared hybrid handoff memory");
     },
 
