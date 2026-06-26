@@ -143,6 +143,12 @@ yt-source-swap-test.js text/javascript
     byVideoId: new Map(),
   };
 
+  const hybridReplayState = {
+    activeVideoId: "",
+    expiresAt: 0,
+    responsesByEndpoint: new Map(),
+  };
+
   function log(...args) {
     if (config.logVerbose) {
       console.log("%c[yt-source-swap]", "font-weight:bold;color:#2b7", ...args);
@@ -272,6 +278,10 @@ yt-source-swap-test.js text/javascript
     return `${location.origin}/youtubei/v1/player?prettyPrint=false`;
   }
 
+  function nextEndpointUrl() {
+    return `${location.origin}/youtubei/v1/next?prettyPrint=false`;
+  }
+
   function buildPlayerReplayFromContainerBody(bodyJson) {
     if (!bodyJson?.playerRequest || typeof bodyJson.playerRequest !== "object") {
       return null;
@@ -289,6 +299,31 @@ yt-source-swap-test.js text/javascript
     }
 
     return playerBody;
+  }
+
+  function buildNextReplayFromContainerBody(bodyJson) {
+    const source =
+      bodyJson?.watchNextRequest ||
+      bodyJson?.nextRequest ||
+      bodyJson?.watchNextEndpoint ||
+      null;
+
+    if (!source || typeof source !== "object") {
+      return null;
+    }
+
+    const nextBody = cloneJson(source);
+
+    if (!nextBody.context) {
+      nextBody.context = cloneJson(bodyJson.context || {});
+    }
+
+    if (!nextBody.context?.client && bodyJson.context?.client) {
+      nextBody.context = nextBody.context || {};
+      nextBody.context.client = cloneJson(bodyJson.context.client);
+    }
+
+    return nextBody;
   }
 
   function stripPlayerAdState(playerResponse) {
@@ -1700,8 +1735,6 @@ yt-source-swap-test.js text/javascript
     }
 
     try {
-      config.enabled = false;
-
       remember({
         event: "hybrid-soft-handoff-attempt",
         method: "player-api",
@@ -1746,6 +1779,19 @@ yt-source-swap-test.js text/javascript
         });
       }, 5000);
 
+      setTimeout(() => {
+        config.enabled = false;
+        hybridReplayState.activeVideoId = "";
+        hybridReplayState.responsesByEndpoint.clear();
+
+        remember({
+          event: "hybrid-warm-replay-closed",
+          videoId,
+          reason: "post-handoff-timeout",
+          videoState: summarizeVideoElementState(),
+        });
+      }, 4000);
+
       return true;
     } catch (err) {
       remember({
@@ -1758,8 +1804,6 @@ yt-source-swap-test.js text/javascript
     }
 
     try {
-      config.enabled = false;
-
       player.loadVideoById(videoId, Math.max(0, Number(resumeAt || 0)));
 
       remember({
@@ -1789,6 +1833,19 @@ yt-source-swap-test.js text/javascript
           videoState: summarizeVideoElementState(),
         });
       }, 5000);
+
+      setTimeout(() => {
+        config.enabled = false;
+        hybridReplayState.activeVideoId = "";
+        hybridReplayState.responsesByEndpoint.clear();
+
+        remember({
+          event: "hybrid-warm-replay-closed",
+          videoId,
+          reason: "post-handoff-timeout",
+          videoState: summarizeVideoElementState(),
+        });
+      }, 4000);
 
       return true;
     } catch (err) {
@@ -1837,19 +1894,33 @@ yt-source-swap-test.js text/javascript
       try {
         const results = [];
 
-        if (meta.bodyJson?.playerRequest) {
-          const playerBody = buildPlayerReplayFromContainerBody(meta.bodyJson);
+        const playerBody = meta.bodyJson?.playerRequest
+          ? buildPlayerReplayFromContainerBody(meta.bodyJson)
+          : null;
 
-          if (playerBody) {
-            const playerWarmup = await fetchOriginalClientWarmupEndpoint(meta, {
-              sourceMode: "web-player-from-container-warmup",
-              url: playerEndpointUrl(),
-              bodyJson: playerBody,
-            });
+        const nextBody = buildNextReplayFromContainerBody(meta.bodyJson);
 
-            results.push(playerWarmup);
-          }
-        } else {
+        if (playerBody) {
+          const playerWarmup = await fetchOriginalClientWarmupEndpoint(meta, {
+            sourceMode: "web-player-from-container-warmup",
+            url: playerEndpointUrl(),
+            bodyJson: playerBody,
+          });
+
+          results.push(playerWarmup);
+        }
+
+        if (nextBody) {
+          const nextWarmup = await fetchOriginalClientWarmupEndpoint(meta, {
+            sourceMode: "web-next-from-container-warmup",
+            url: nextEndpointUrl(),
+            bodyJson: nextBody,
+          });
+
+          results.push(nextWarmup);
+        }
+
+        if (!playerBody && !nextBody) {
           const sameEndpointWarmup = await fetchOriginalClientWarmupEndpoint(meta, {
             sourceMode: "web-same-endpoint-warmup",
             url: meta.url,
@@ -1887,6 +1958,81 @@ yt-source-swap-test.js text/javascript
     });
 
     return record;
+  }
+
+  function armHybridWarmReplay(videoId, warmup) {
+    hybridReplayState.activeVideoId = videoId;
+    hybridReplayState.expiresAt = performance.now() + 10000;
+    hybridReplayState.responsesByEndpoint.clear();
+
+    for (const result of warmup?.results || []) {
+      if (!result?.ok || !result?.json) continue;
+
+      const endpoint = result.endpoint || "";
+      if (!endpoint) continue;
+
+      hybridReplayState.responsesByEndpoint.set(endpoint, {
+        endpoint,
+        sourceMode: result.sourceMode || "",
+        httpStatus: result.httpStatus || 200,
+        statusText: result.statusText || "OK",
+        json: result.json,
+        responseText: result.responseText || JSON.stringify(result.json),
+        durationMs: result.durationMs || 0,
+      });
+    }
+
+    remember({
+      event: "hybrid-warm-replay-armed",
+      videoId,
+      endpoints: [...hybridReplayState.responsesByEndpoint.keys()],
+      expiresInMs: Math.round(hybridReplayState.expiresAt - performance.now()),
+    });
+  }
+
+  function maybeMakeHybridWarmReplayResponse(meta) {
+    const endpoint = meta.endpoint || endpointForUrl(meta.url);
+    const now = performance.now();
+
+    if (!hybridReplayState.activeVideoId) return null;
+
+    if (now > hybridReplayState.expiresAt) {
+      hybridReplayState.activeVideoId = "";
+      hybridReplayState.responsesByEndpoint.clear();
+      return null;
+    }
+
+    const requestVideoId = getBodyVideoId(meta.bodyJson) || getCurrentEffectiveVideoId();
+
+    if (
+      hybridReplayState.activeVideoId &&
+      requestVideoId &&
+      requestVideoId !== hybridReplayState.activeVideoId
+    ) {
+      return null;
+    }
+
+    const cached = hybridReplayState.responsesByEndpoint.get(endpoint);
+    if (!cached) return null;
+
+    remember({
+      event: "hybrid-warm-replay-hit",
+      endpoint,
+      videoId: hybridReplayState.activeVideoId,
+      requestVideoId,
+      sourceMode: cached.sourceMode,
+      originalDurationMs: cached.durationMs,
+      transport: meta.transport,
+    });
+
+    return new Response(cached.responseText, {
+      status: cached.httpStatus,
+      statusText: cached.statusText,
+      headers: {
+        "content-type": "application/json; charset=utf-8",
+        "x-yt-source-swap-warm-replay": endpoint,
+      },
+    });
   }
 
   function scheduleHybridStartupHandoff(videoId) {
@@ -2020,7 +2166,9 @@ yt-source-swap-test.js text/javascript
 
       persistHybridHandoff(videoId, resumeAt);
 
-      config.enabled = false;
+      armHybridWarmReplay(videoId, warmup);
+
+      config.enabled = true;
 
       remember({
         event: "hybrid-handoff-start",
@@ -2096,9 +2244,12 @@ yt-source-swap-test.js text/javascript
       endpoint: endpointForUrl(targetUrl),
       sourceMode,
       httpStatus: resp.status,
+      statusText: resp.statusText,
       ok: resp.ok,
       durationMs: Math.round(performance.now() - started),
       gzip,
+      json,
+      responseText: json ? JSON.stringify(json) : text,
       summary: endpointSummary.direct,
       endpointSummary,
       hasServerAbr: !!endpointSummary?.direct?.hasServerAbr,
@@ -2838,6 +2989,11 @@ yt-source-swap-test.js text/javascript
 
       meta = await readFetchMeta(input, init);
 
+      const warmReplayResp = maybeMakeHybridWarmReplayResponse(meta);
+      if (warmReplayResp) {
+        return warmReplayResp;
+      }
+
       counters.seen++;
       counters.seenFetch++;
       counters.lastTransport = "fetch";
@@ -3165,6 +3321,9 @@ yt-source-swap-test.js text/javascript
       hybridState.activeVideoId = "";
       hybridState.activePatchVideoId = "";
       hybridWarmupState.byVideoId.clear();
+      hybridReplayState.activeVideoId = "";
+      hybridReplayState.expiresAt = 0;
+      hybridReplayState.responsesByEndpoint.clear();
     },
 
     useAutoFallback() {
@@ -3283,6 +3442,9 @@ yt-source-swap-test.js text/javascript
       clearHybridHandoffTimer();
       clearPersistedHybridHandoff();
       hybridWarmupState.byVideoId.clear();
+      hybridReplayState.activeVideoId = "";
+      hybridReplayState.expiresAt = 0;
+      hybridReplayState.responsesByEndpoint.clear();
       console.log("[yt-source-swap] cleared hybrid handoff memory");
     },
 
