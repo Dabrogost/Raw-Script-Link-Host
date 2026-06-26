@@ -70,7 +70,7 @@ yt-source-swap-test.js text/javascript
     interceptFetch: true,
     interceptXhr: true,
     allowClassicOnlyFromSabrTargets: true,
-    classicPatchMode: "progressive-only",
+    classicPatchMode: "mweb-progressive-auto",
     allowCipherUrlWithoutDecipher: false,
     endpoints: {
       player: false,
@@ -811,6 +811,65 @@ yt-source-swap-test.js text/javascript
     return isClassicNonSabrUrl(format?.url || "");
   }
 
+  function getFormatItag(format) {
+    return String(format?.itag || "");
+  }
+
+  function isItag18(format) {
+    return getFormatItag(format) === "18";
+  }
+
+  function getCipherString(format) {
+    return format?.signatureCipher || format?.cipher || "";
+  }
+
+  function hasRawClassicCipher(format) {
+    const cipher = getCipherString(format);
+    if (!cipher) return false;
+
+    const parsed = parseCipherString(cipher);
+    return isClassicNonSabrUrl(parsed.url);
+  }
+
+  function hasDirectClassicUrlOrCipher(format) {
+    return hasDirectClassicUrl(format) || hasRawClassicCipher(format);
+  }
+
+  function classifyProgressiveCandidate(format) {
+    if (!isItag18(format)) return "";
+
+    if (hasDirectClassicUrl(format)) {
+      return "direct-url";
+    }
+
+    if (hasRawClassicCipher(format)) {
+      return "raw-cipher";
+    }
+
+    return "";
+  }
+
+  function hasMwebProgressiveAutoCandidate(streamingData) {
+    const formats = Array.isArray(streamingData?.formats) ? streamingData.formats : [];
+
+    return formats.some(format =>
+      classifyProgressiveCandidate(format) === "direct-url" ||
+      classifyProgressiveCandidate(format) === "raw-cipher"
+    );
+  }
+
+  function hasPatchedProgressiveAutoCandidate(streamingData) {
+    const formats = Array.isArray(streamingData?.formats) ? streamingData.formats : [];
+
+    return (
+      formats.length === 1 &&
+      formats.some(format =>
+        classifyProgressiveCandidate(format) === "direct-url" ||
+        classifyProgressiveCandidate(format) === "raw-cipher"
+      )
+    );
+  }
+
   function isProgressiveFormat(format) {
     return (
       format?.itag === 18 ||
@@ -919,10 +978,45 @@ yt-source-swap-test.js text/javascript
     return clean;
   }
 
+  function cloneMwebProgressiveAutoStreamingData(streamingData) {
+    const clean = cloneJson(streamingData || {});
+
+    delete clean.serverAbrStreamingUrl;
+    delete clean.sabrStreamingUrl;
+    delete clean.serverAbrStreamingUrlConfig;
+
+    const formats = Array.isArray(clean.formats) ? clean.formats : [];
+
+    const direct = formats.find(format =>
+      classifyProgressiveCandidate(format) === "direct-url"
+    );
+
+    const rawCipher = formats.find(format =>
+      classifyProgressiveCandidate(format) === "raw-cipher"
+    );
+
+    const selected = direct || rawCipher || null;
+    const selectedMode = direct ? "direct-url" : rawCipher ? "raw-cipher" : "";
+
+    clean.formats = selected ? [cloneJson(selected)] : [];
+    clean.adaptiveFormats = [];
+
+    clean.__sourceSwapSelection = {
+      selectedMode,
+      selectedItag: selected ? String(selected.itag || "") : "",
+      hadDirectCandidate: !!direct,
+      hadRawCipherCandidate: !!rawCipher,
+    };
+
+    return clean;
+  }
+
   function makeSyntheticPlayerWithStreamingData(basePlayer, streamingData) {
     const cloned = cloneJson(basePlayer || {});
 
-    if (config.classicPatchMode === "progressive-only") {
+    if (config.classicPatchMode === "mweb-progressive-auto") {
+      cloned.streamingData = cloneMwebProgressiveAutoStreamingData(streamingData);
+    } else if (config.classicPatchMode === "progressive-only") {
       cloned.streamingData = cloneProgressiveOnlyStreamingData(streamingData);
     } else if (config.classicPatchMode === "progressive-cipher-url-only") {
       cloned.streamingData = cloneProgressiveCipherUrlOnlyStreamingData(streamingData);
@@ -966,7 +1060,11 @@ yt-source-swap-test.js text/javascript
         config.classicPatchMode === "progressive-raw-cipher" &&
         hasProgressiveRawCipherCandidate(streamingData);
 
-      if (!canUseDirectClassic && !canUseRawCipher) {
+      const canUseAuto =
+        config.classicPatchMode === "mweb-progressive-auto" &&
+        hasMwebProgressiveAutoCandidate(streamingData);
+
+      if (!canUseDirectClassic && !canUseRawCipher && !canUseAuto) {
         continue;
       }
 
@@ -980,7 +1078,14 @@ yt-source-swap-test.js text/javascript
         !summary.hasServerAbr &&
         hasPlayableProgressiveCandidate(synthetic.streamingData);
 
-      if (playerSummaryIsUsable(summary) || progressiveRawCipherOk) {
+      const progressiveAutoOk =
+        config.classicPatchMode === "mweb-progressive-auto" &&
+        summary.status === "OK" &&
+        !summary.hasSabr &&
+        !summary.hasServerAbr &&
+        hasPatchedProgressiveAutoCandidate(synthetic.streamingData);
+
+      if (playerSummaryIsUsable(summary) || progressiveRawCipherOk || progressiveAutoOk) {
         return {
           path: match.path,
           value: synthetic,
@@ -990,7 +1095,9 @@ yt-source-swap-test.js text/javascript
           mode: config.classicPatchMode,
           acceptedBy: playerSummaryIsUsable(summary)
             ? "playerSummaryIsUsable"
-            : "progressiveRawCipherOk",
+            : progressiveAutoOk
+              ? "progressiveAutoOk"
+              : "progressiveRawCipherOk",
         };
       }
     }
@@ -1383,9 +1490,17 @@ yt-source-swap-test.js text/javascript
       !patchedSummary.hasServerAbr &&
       hasPlayableProgressiveCandidate(modernPlayer.value.streamingData);
 
+    const patchedProgressiveAutoOk =
+      config.classicPatchMode === "mweb-progressive-auto" &&
+      patchedSummary.status === "OK" &&
+      !patchedSummary.hasSabr &&
+      !patchedSummary.hasServerAbr &&
+      hasPatchedProgressiveAutoCandidate(modernPlayer.value.streamingData);
+
     const patchedUsable =
       playerSummaryIsUsable(patchedSummary) ||
-      patchedProgressiveRawCipherOk;
+      patchedProgressiveRawCipherOk ||
+      patchedProgressiveAutoOk;
 
     // Require the patch to be usable AND ad-state to be fully clean.
     if (
@@ -1465,6 +1580,8 @@ yt-source-swap-test.js text/javascript
       adStateBeforeStrip,
       adStateAfterStrip,
       classicPatchMode: config.classicPatchMode,
+      progressiveAutoSelection:
+        targetPlayer.value.streamingData?.__sourceSwapSelection || null,
       rawCipherCandidate: hasProgressiveRawCipherCandidate(targetPlayer.value.streamingData),
       playableProgressiveCandidate: hasPlayableProgressiveCandidate(targetPlayer.value.streamingData),
       acceptedBy: targetPlayer.acceptedBy || "",
