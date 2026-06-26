@@ -69,6 +69,7 @@ yt-source-swap-test.js text/javascript
     logMediaErrors: true,
     interceptFetch: true,
     interceptXhr: true,
+    allowClassicOnlyFromSabrTargets: true,
     endpoints: {
       player: false,
       getWatch: true,
@@ -103,7 +104,7 @@ yt-source-swap-test.js text/javascript
   };
 
   let lastPatch = {
-    time: 0,
+    time: -Infinity,
     targetProfile: "",
     sourceMode: "",
     requestVideoId: "",
@@ -655,6 +656,91 @@ yt-source-swap-test.js text/javascript
     return matches[0] || null;
   }
 
+  function summarizeStreamingDataUrls(streamingData) {
+    const formats = Array.isArray(streamingData?.formats) ? streamingData.formats : [];
+    const adaptiveFormats = Array.isArray(streamingData?.adaptiveFormats) ? streamingData.adaptiveFormats : [];
+    const all = formats.concat(adaptiveFormats);
+
+    const directUrls = all
+      .map(f => f.url || "")
+      .filter(Boolean);
+
+    const cipherEntries = all
+      .map(f => f.signatureCipher || f.cipher || "")
+      .filter(Boolean);
+
+    const sabrUrlCount = directUrls.filter(u =>
+      /(?:[?&]|%26)sabr(?:=|%3D)1/i.test(String(u))
+    ).length;
+
+    const classicUrlCount = directUrls.length - sabrUrlCount;
+
+    return {
+      formats: formats.length,
+      adaptiveFormats: adaptiveFormats.length,
+      directUrlCount: directUrls.length,
+      cipherEntryCount: cipherEntries.length,
+      classicUrlCount,
+      sabrUrlCount,
+      hasServerAbr: !!streamingData?.serverAbrStreamingUrl,
+      hasAnyClassicUrl: classicUrlCount > 0,
+      sampleClassic: directUrls.find(u => !/(?:[?&]|%26)sabr(?:=|%3D)1/i.test(String(u)))?.slice(0, 240) || "",
+      sampleSabr: directUrls.find(u => /(?:[?&]|%26)sabr(?:=|%3D)1/i.test(String(u)))?.slice(0, 240) || "",
+    };
+  }
+
+  function cloneClassicOnlyStreamingData(streamingData) {
+    const clean = cloneJson(streamingData || {});
+
+    delete clean.serverAbrStreamingUrl;
+    delete clean.sabrStreamingUrl;
+    delete clean.serverAbrStreamingUrlConfig;
+
+    return clean;
+  }
+
+  function makeSyntheticPlayerWithStreamingData(basePlayer, streamingData) {
+    const cloned = cloneJson(basePlayer || {});
+    cloned.streamingData = cloneClassicOnlyStreamingData(streamingData);
+    return cloned;
+  }
+
+  function findClassicOnlyCandidateForVideo(root, wantedVideoId = "") {
+    const matches = findPlayerLikeObjects(root);
+
+    let candidates = matches;
+
+    if (wantedVideoId) {
+      const exact = matches.filter(p => getPlayerVideoId(p.value) === wantedVideoId);
+      if (exact.length) candidates = exact;
+    }
+
+    for (const match of candidates) {
+      const streamingData = match.value?.streamingData;
+      if (!streamingData) continue;
+
+      const details = summarizeStreamingDataUrls(streamingData);
+
+      if (!details.hasAnyClassicUrl) continue;
+
+      const synthetic = makeSyntheticPlayerWithStreamingData(match.value, streamingData);
+      const summary = summarizePlayerResponse(synthetic);
+
+      if (playerSummaryIsUsable(summary)) {
+        return {
+          path: match.path,
+          value: synthetic,
+          summary,
+          originalSummary: match.summary,
+          streamingDetails: details,
+          mode: "classic-only-strip-serverAbr",
+        };
+      }
+    }
+
+    return null;
+  }
+
   function summarizeEndpointResponse(json) {
     const direct = summarizePlayerResponse(json);
     const nestedPlayers = findPlayerLikeObjects(json);
@@ -890,7 +976,18 @@ yt-source-swap-test.js text/javascript
     let targetResult = await fetchTargetClientEndpoint(meta, {
       sourceMode: "same-endpoint",
     });
+    let lastTargetResult = targetResult;
     let targetPlayer = findBestUsablePlayerObjectForVideo(targetResult.json, wantedVideoId);
+    let targetSelectionMode = "direct-usable";
+
+    if (!targetPlayer && config.allowClassicOnlyFromSabrTargets) {
+      const classicOnlyTarget = findClassicOnlyCandidateForVideo(targetResult.json, wantedVideoId);
+
+      if (classicOnlyTarget) {
+        targetPlayer = classicOnlyTarget;
+        targetSelectionMode = classicOnlyTarget.mode;
+      }
+    }
 
     if (!targetPlayer && endpoint === "get_watch" && meta.bodyJson?.playerRequest) {
       const playerBody = buildPlayerReplayFromContainerBody(meta.bodyJson);
@@ -913,8 +1010,23 @@ yt-source-swap-test.js text/javascript
           bodyJson: playerBody,
         });
 
-        const playerTarget = findBestUsablePlayerObjectForVideo(playerResult.json, wantedVideoId);
+        lastTargetResult = playerResult;
+
+        let playerTarget = findBestUsablePlayerObjectForVideo(playerResult.json, wantedVideoId);
+
+        if (!playerTarget && config.allowClassicOnlyFromSabrTargets) {
+          const classicOnlyTarget = findClassicOnlyCandidateForVideo(playerResult.json, wantedVideoId);
+
+          if (classicOnlyTarget) {
+            playerTarget = classicOnlyTarget;
+            targetSelectionMode = classicOnlyTarget.mode;
+          }
+        }
+
         const firstPlayerTarget = findFirstPlayerObject(playerResult.json);
+        const firstTargetStreamingDetails = firstPlayerTarget?.value?.streamingData
+          ? summarizeStreamingDataUrls(firstPlayerTarget.value.streamingData)
+          : null;
 
         remember({
           event: "target-player-from-container-result",
@@ -930,9 +1042,11 @@ yt-source-swap-test.js text/javascript
           targetBestUsable: !!playerTarget,
           targetBestPath: playerTarget?.path || "",
           targetSummary: playerTarget?.summary || null,
+          targetSelectionMode,
 
           firstTargetPath: firstPlayerTarget?.path || "",
           firstTargetSummary: firstPlayerTarget?.summary || null,
+          firstTargetStreamingDetails,
 
           rejectedBecause: firstPlayerTarget
             ? {
@@ -965,18 +1079,19 @@ yt-source-swap-test.js text/javascript
         transport: meta.transport,
         endpoint,
         reason: counters.lastReason,
-        sourceMode: targetResult?.sourceMode || "",
-        targetProfile: targetResult?.targetProfile || getTargetProfile().key,
-        targetClientName: targetResult?.targetClientName || getTargetProfile().clientName,
-        targetClientVersion: targetResult?.targetClientVersion || getTargetProfile().clientVersion,
-        targetHttpStatus: targetResult?.httpStatus || 0,
-        targetNestedPlayerCount: targetResult?.endpointSummary?.nestedPlayerCount || 0,
+        sourceMode: lastTargetResult?.sourceMode || "",
+        targetProfile: lastTargetResult?.targetProfile || getTargetProfile().key,
+        targetClientName: lastTargetResult?.targetClientName || getTargetProfile().clientName,
+        targetClientVersion: lastTargetResult?.targetClientVersion || getTargetProfile().clientVersion,
+        targetHttpStatus: lastTargetResult?.httpStatus || 0,
+        targetNestedPlayerCount: lastTargetResult?.endpointSummary?.nestedPlayerCount || 0,
         targetBestUsable: !!targetPlayer,
         requestVideoId: wantedVideoId,
         pageVideoId: getCurrentPageVideoId(),
         modernHasPlayer: !!modernPlayer,
         targetBestPath: targetPlayer?.path || "",
         modernPath: modernPlayer?.path || "",
+        targetSelectionMode,
       });
 
       return originalResp;
@@ -1012,12 +1127,12 @@ yt-source-swap-test.js text/javascript
         transport: meta.transport,
         endpoint,
         reason: counters.lastReason,
-        sourceMode: targetResult?.sourceMode || "",
-        targetProfile: targetResult?.targetProfile || getTargetProfile().key,
-        targetClientName: targetResult?.targetClientName || getTargetProfile().clientName,
-        targetClientVersion: targetResult?.targetClientVersion || getTargetProfile().clientVersion,
-        targetHttpStatus: targetResult?.httpStatus || 0,
-        targetNestedPlayerCount: targetResult?.endpointSummary?.nestedPlayerCount || 0,
+        sourceMode: lastTargetResult?.sourceMode || "",
+        targetProfile: lastTargetResult?.targetProfile || getTargetProfile().key,
+        targetClientName: lastTargetResult?.targetClientName || getTargetProfile().clientName,
+        targetClientVersion: lastTargetResult?.targetClientVersion || getTargetProfile().clientVersion,
+        targetHttpStatus: lastTargetResult?.httpStatus || 0,
+        targetNestedPlayerCount: lastTargetResult?.endpointSummary?.nestedPlayerCount || 0,
         targetBestUsable: !!targetPlayer,
         requestVideoId: wantedVideoId,
         pageVideoId: getCurrentPageVideoId(),
@@ -1027,6 +1142,7 @@ yt-source-swap-test.js text/javascript
         adStateBeforeStrip,
         adStateAfterStrip,
         patchedSummary,
+        targetSelectionMode,
       });
 
       return originalResp;
@@ -1054,10 +1170,13 @@ yt-source-swap-test.js text/javascript
       targetDurationMs: targetResult.durationMs,
       targetPath: targetPlayer.path,
       modernPath: modernPlayer.path,
-      adStateBeforeStrip,
-      adStateAfterStrip,
+      targetSelectionMode,
+      targetStreamingDetails: targetPlayer.streamingDetails || null,
+      targetOriginalSummary: targetPlayer.originalSummary || null,
       targetSummary: targetPlayer.summary,
       patchedSummary,
+      adStateBeforeStrip,
+      adStateAfterStrip,
     });
 
     lastPatch = {
@@ -1191,7 +1310,11 @@ yt-source-swap-test.js text/javascript
       if (config.logMediaErrors && isMediaUrl(rawUrl)) {
         const resp = await nativeFetch.apply(this, arguments);
         const recentPatchAgeMs = performance.now() - lastPatch.time;
-        const maybeFromPatch = recentPatchAgeMs >= 0 && recentPatchAgeMs < 15000;
+        const maybeFromPatch =
+          !!lastPatch.targetProfile &&
+          Number.isFinite(recentPatchAgeMs) &&
+          recentPatchAgeMs >= 0 &&
+          recentPatchAgeMs < 15000;
 
         if (!resp.ok) {
           remember({
