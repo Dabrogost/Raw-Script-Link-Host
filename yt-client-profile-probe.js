@@ -26,7 +26,7 @@ yt-client-profile-probe.js text/javascript
     interceptXhr: true,
     captureEndpoints: {
       getWatch: true,
-      player: true,
+      player: false,
       next: false,
     },
   };
@@ -398,7 +398,15 @@ yt-client-profile-probe.js text/javascript
     if (!isCaptureEndpointEnabled(meta.endpoint)) return [false, `endpoint-disabled-${meta.endpoint}`];
     if (String(meta.method || "").toUpperCase() !== "POST") return [false, "not-post"];
     if (!meta.bodyJson) return [false, "no-json-body"];
-    if (!meta.bodyJson?.context?.client) return [false, "no-context-client"];
+
+    const client = meta.bodyJson?.context?.client;
+    if (!client) return [false, "no-context-client"];
+
+    const clientName = String(client.clientName || "");
+    if (clientName !== "WEB") {
+      return [false, `seed-client-${clientName || "missing"}`];
+    }
+
     return [true, "ok"];
   }
 
@@ -418,6 +426,7 @@ yt-client-profile-probe.js text/javascript
       originalClientVersion: meta.bodyJson?.context?.client?.clientVersion || "",
       bodyType: meta.bodyType,
       bodyTextLength: meta.bodyTextLength,
+      seedAcceptedReason: "web-source-request",
     };
 
     remember({
@@ -430,6 +439,7 @@ yt-client-profile-probe.js text/javascript
       originalClientVersion: lastProbeSeed.originalClientVersion,
       bodyType: meta.bodyType,
       bodyTextLength: meta.bodyTextLength,
+      seedAcceptedReason: "web-source-request",
       topKeys: meta.bodyJson ? Object.keys(meta.bodyJson).slice(0, 40) : [],
     });
   }
@@ -884,9 +894,18 @@ yt-client-profile-probe.js text/javascript
   // Probe one profile
   // ---------------------------------------------------------------------------
 
+  function lastSeedIsFresh(maxAgeMs = 60000) {
+    return (
+      !!lastProbeSeed?.bodyJson &&
+      Number.isFinite(lastProbeSeed.time) &&
+      performance.now() - lastProbeSeed.time >= 0 &&
+      performance.now() - lastProbeSeed.time <= maxAgeMs
+    );
+  }
+
   async function probeOneProfile(profileInput) {
-    if (!lastProbeSeed?.bodyJson) {
-      throw new Error("No recent YouTube request captured yet. Navigate to a YouTube video first.");
+    if (!lastSeedIsFresh()) {
+      throw new Error("No fresh WEB YouTube request captured yet. Navigate to a YouTube video first.");
     }
 
     const profile =
@@ -993,6 +1012,20 @@ yt-client-profile-probe.js text/javascript
     config,
     events,
     probeProfilesConfig: PROBE_PROFILES,
+
+    useGetWatchOnly() {
+      config.captureEndpoints.getWatch = true;
+      config.captureEndpoints.player = false;
+      config.captureEndpoints.next = false;
+      console.log("[yt-client-profile-probe] capturing get_watch only");
+    },
+
+    usePlayerOnly() {
+      config.captureEndpoints.getWatch = false;
+      config.captureEndpoints.player = true;
+      config.captureEndpoints.next = false;
+      console.log("[yt-client-profile-probe] capturing player only");
+    },
 
     probeLast() {
       return lastProbeSeed
