@@ -57,6 +57,14 @@ yt-source-swap-test.js text/javascript
       clientHeaderName: "7",
       notes: "Candidate version; must be console-editable",
     },
+
+    webCreator: {
+      key: "webCreator",
+      clientName: "WEB_CREATOR",
+      clientVersion: "1.20260625.01.00",
+      clientHeaderName: "62",
+      notes: "Probe found classic adaptive direct URL pairs",
+    },
   };
 
   const config = {
@@ -1016,6 +1024,10 @@ yt-source-swap-test.js text/javascript
       cloned.streamingData = cloneProgressiveCipherUrlOnlyStreamingData(streamingData);
     } else if (config.classicPatchMode === "progressive-raw-cipher") {
       cloned.streamingData = cloneProgressiveRawCipherStreamingData(streamingData);
+    } else if (config.classicPatchMode === "webcreator-adaptive-classic-auto") {
+      const result = cloneAdaptiveClassicStreamingData(streamingData);
+      cloned.streamingData = result.streamingData;
+      sourceSwapSelection = result.adaptiveClassicSelection;
     } else {
       cloned.streamingData = cloneClassicOnlyStreamingData(streamingData);
     }
@@ -1045,6 +1057,173 @@ yt-source-swap-test.js text/javascript
         return kind === "direct-url" || kind === "raw-cipher";
       })
     );
+  }
+
+  function getFormatUrlMode(format) {
+    if (hasDirectClassicUrl(format)) return "direct-url";
+    if (hasRawClassicCipher(format)) return "raw-cipher";
+    return "";
+  }
+
+  function isUsableClassicFormat(format) {
+    return !!getFormatUrlMode(format);
+  }
+
+  function isVideoFormat(format) {
+    return String(format?.mimeType || "").includes("video/");
+  }
+
+  function isAudioFormat(format) {
+    return String(format?.mimeType || "").includes("audio/");
+  }
+
+  function getFormatHeight(format) {
+    return Number(format?.height || 0);
+  }
+
+  function getFormatBitrate(format) {
+    return Number(format?.bitrate || format?.averageBitrate || 0);
+  }
+
+  function hasUsableAdaptiveClassicPair(streamingData) {
+    const adaptiveFormats = Array.isArray(streamingData?.adaptiveFormats)
+      ? streamingData.adaptiveFormats
+      : [];
+
+    const hasVideo = adaptiveFormats.some(format =>
+      isVideoFormat(format) &&
+      isUsableClassicFormat(format)
+    );
+
+    const hasAudio = adaptiveFormats.some(format =>
+      isAudioFormat(format) &&
+      isUsableClassicFormat(format)
+    );
+
+    return hasVideo && hasAudio;
+  }
+
+  function pickBestAdaptiveClassicPair(streamingData) {
+    const adaptiveFormats = Array.isArray(streamingData?.adaptiveFormats)
+      ? streamingData.adaptiveFormats
+      : [];
+
+    const videos = adaptiveFormats
+      .filter(format =>
+        isVideoFormat(format) &&
+        isUsableClassicFormat(format)
+      )
+      .sort((a, b) => {
+        const heightDelta = getFormatHeight(b) - getFormatHeight(a);
+        if (heightDelta) return heightDelta;
+        return getFormatBitrate(b) - getFormatBitrate(a);
+      });
+
+    const audios = adaptiveFormats
+      .filter(format =>
+        isAudioFormat(format) &&
+        isUsableClassicFormat(format)
+      )
+      .sort((a, b) => getFormatBitrate(b) - getFormatBitrate(a));
+
+    return {
+      video: videos[0] || null,
+      audio: audios[0] || null,
+      videoCount: videos.length,
+      audioCount: audios.length,
+    };
+  }
+
+  function summarizeAdaptiveClassicPair(pair) {
+    function summarize(format) {
+      if (!format) return null;
+
+      const cipher = getCipherString(format);
+      const parsedCipher = parseCipherString(cipher);
+      const rawUrl = format?.url || parsedCipher.url || "";
+      let urlInfo = null;
+
+      try {
+        if (rawUrl) {
+          const u = new URL(rawUrl);
+          urlInfo = {
+            host: u.hostname,
+            itag: u.searchParams.get("itag") || "",
+            mime: u.searchParams.get("mime") || "",
+            c: u.searchParams.get("c") || "",
+            hasSabr: /(?:[?&]|%26)sabr(?:=|%3D)1/i.test(rawUrl),
+            urlStart: rawUrl.slice(0, 260),
+          };
+        }
+      } catch {}
+
+      return {
+        itag: format?.itag || "",
+        mimeType: format?.mimeType || "",
+        quality: format?.quality || "",
+        qualityLabel: format?.qualityLabel || "",
+        height: getFormatHeight(format),
+        bitrate: getFormatBitrate(format),
+        audioQuality: format?.audioQuality || "",
+        audioSampleRate: format?.audioSampleRate || "",
+        audioChannels: format?.audioChannels || null,
+        mode: getFormatUrlMode(format),
+        hasUrl: !!format?.url,
+        hasSignatureCipher: !!format?.signatureCipher,
+        hasCipher: !!format?.cipher,
+        urlInfo,
+      };
+    }
+
+    return {
+      videoCount: pair?.videoCount || 0,
+      audioCount: pair?.audioCount || 0,
+      video: summarize(pair?.video),
+      audio: summarize(pair?.audio),
+      hasPair: !!pair?.video && !!pair?.audio,
+    };
+  }
+
+  function hasSelectedAdaptiveClassicPair(streamingData) {
+    const formats = Array.isArray(streamingData?.formats) ? streamingData.formats : [];
+    const adaptiveFormats = Array.isArray(streamingData?.adaptiveFormats)
+      ? streamingData.adaptiveFormats
+      : [];
+
+    if (formats.length !== 0) return false;
+    if (adaptiveFormats.length !== 2) return false;
+
+    const hasVideo = adaptiveFormats.some(format =>
+      isVideoFormat(format) &&
+      isUsableClassicFormat(format)
+    );
+
+    const hasAudio = adaptiveFormats.some(format =>
+      isAudioFormat(format) &&
+      isUsableClassicFormat(format)
+    );
+
+    return hasVideo && hasAudio;
+  }
+
+  function cloneAdaptiveClassicStreamingData(streamingData) {
+    const clean = cloneJson(streamingData || {});
+
+    delete clean.serverAbrStreamingUrl;
+    delete clean.sabrStreamingUrl;
+    delete clean.serverAbrStreamingUrlConfig;
+
+    const pair = pickBestAdaptiveClassicPair(clean);
+
+    clean.formats = [];
+    clean.adaptiveFormats = pair.video && pair.audio
+      ? [cloneJson(pair.video), cloneJson(pair.audio)]
+      : [];
+
+    return {
+      streamingData: clean,
+      adaptiveClassicSelection: summarizeAdaptiveClassicPair(pair),
+    };
   }
 
   function hasMeaningfulAdState(adState) {
@@ -1084,7 +1263,11 @@ yt-source-swap-test.js text/javascript
         config.classicPatchMode === "mweb-progressive-auto" &&
         hasMwebProgressiveAutoCandidate(streamingData);
 
-      if (!canUseDirectClassic && !canUseRawCipher && !canUseAuto) {
+      const canUseAdaptiveClassic =
+        config.classicPatchMode === "webcreator-adaptive-classic-auto" &&
+        hasUsableAdaptiveClassicPair(streamingData);
+
+      if (!canUseDirectClassic && !canUseRawCipher && !canUseAuto && !canUseAdaptiveClassic) {
         continue;
       }
 
@@ -1109,14 +1292,23 @@ yt-source-swap-test.js text/javascript
         !summary.hasServerAbr &&
         hasPatchedProgressiveAutoCandidate(synthetic.streamingData);
 
+      const adaptiveClassicOk =
+        config.classicPatchMode === "webcreator-adaptive-classic-auto" &&
+        summary.status === "OK" &&
+        !summary.hasSabr &&
+        !summary.hasServerAbr &&
+        hasSelectedAdaptiveClassicPair(synthetic.streamingData);
+
       const acceptedBy =
-        progressiveAutoOk
-          ? "progressiveAutoOk"
-          : progressiveRawCipherOk
-            ? "progressiveRawCipherOk"
-            : baseUsable
-              ? "playerSummaryIsUsable"
-              : "";
+        adaptiveClassicOk
+          ? "adaptiveClassicOk"
+          : progressiveAutoOk
+            ? "progressiveAutoOk"
+            : progressiveRawCipherOk
+              ? "progressiveRawCipherOk"
+              : baseUsable
+                ? "playerSummaryIsUsable"
+                : "";
 
       if (acceptedBy) {
         return {
@@ -1133,6 +1325,41 @@ yt-source-swap-test.js text/javascript
     }
 
     return null;
+  }
+
+  function selectTargetPlayerForCurrentMode(root, wantedVideoId = "") {
+    if (config.classicPatchMode === "webcreator-adaptive-classic-auto") {
+      const adaptiveClassicTarget = findClassicOnlyCandidateForVideo(root, wantedVideoId);
+
+      if (adaptiveClassicTarget) {
+        return {
+          targetPlayer: adaptiveClassicTarget,
+          targetSelectionMode: adaptiveClassicTarget.mode,
+        };
+      }
+
+      return {
+        targetPlayer: null,
+        targetSelectionMode: "webcreator-adaptive-classic-missing",
+      };
+    }
+
+    let targetPlayer = findBestUsablePlayerObjectForVideo(root, wantedVideoId);
+    let targetSelectionMode = "direct-usable";
+
+    if (!targetPlayer && config.allowClassicOnlyFromSabrTargets) {
+      const classicOnlyTarget = findClassicOnlyCandidateForVideo(root, wantedVideoId);
+
+      if (classicOnlyTarget) {
+        targetPlayer = classicOnlyTarget;
+        targetSelectionMode = classicOnlyTarget.mode;
+      }
+    }
+
+    return {
+      targetPlayer,
+      targetSelectionMode,
+    };
   }
 
   function summarizeEndpointResponse(json) {
@@ -1375,17 +1602,10 @@ yt-source-swap-test.js text/javascript
       sourceMode: "same-endpoint",
     });
     let lastTargetResult = targetResult;
-    let targetPlayer = findBestUsablePlayerObjectForVideo(targetResult.json, wantedVideoId);
-    let targetSelectionMode = "direct-usable";
 
-    if (!targetPlayer && config.allowClassicOnlyFromSabrTargets) {
-      const classicOnlyTarget = findClassicOnlyCandidateForVideo(targetResult.json, wantedVideoId);
-
-      if (classicOnlyTarget) {
-        targetPlayer = classicOnlyTarget;
-        targetSelectionMode = classicOnlyTarget.mode;
-      }
-    }
+    let selectedTarget = selectTargetPlayerForCurrentMode(targetResult.json, wantedVideoId);
+    let targetPlayer = selectedTarget.targetPlayer;
+    let targetSelectionMode = selectedTarget.targetSelectionMode;
 
     if (!targetPlayer && endpoint === "get_watch" && meta.bodyJson?.playerRequest) {
       const playerBody = buildPlayerReplayFromContainerBody(meta.bodyJson);
@@ -1410,15 +1630,11 @@ yt-source-swap-test.js text/javascript
 
         lastTargetResult = playerResult;
 
-        let playerTarget = findBestUsablePlayerObjectForVideo(playerResult.json, wantedVideoId);
+        const selectedPlayerTarget = selectTargetPlayerForCurrentMode(playerResult.json, wantedVideoId);
+        let playerTarget = selectedPlayerTarget.targetPlayer;
 
-        if (!playerTarget && config.allowClassicOnlyFromSabrTargets) {
-          const classicOnlyTarget = findClassicOnlyCandidateForVideo(playerResult.json, wantedVideoId);
-
-          if (classicOnlyTarget) {
-            playerTarget = classicOnlyTarget;
-            targetSelectionMode = classicOnlyTarget.mode;
-          }
+        if (playerTarget) {
+          targetSelectionMode = selectedPlayerTarget.targetSelectionMode;
         }
 
         const firstPlayerTarget = findFirstPlayerObject(playerResult.json);
@@ -1556,7 +1772,15 @@ yt-source-swap-test.js text/javascript
       !patchedSummary.hasServerAbr &&
       hasSelectedProgressiveItag18(modernPlayer.value.streamingData);
 
+    const patchedAdaptiveClassicOk =
+      config.classicPatchMode === "webcreator-adaptive-classic-auto" &&
+      patchedSummary.status === "OK" &&
+      !patchedSummary.hasSabr &&
+      !patchedSummary.hasServerAbr &&
+      hasSelectedAdaptiveClassicPair(modernPlayer.value.streamingData);
+
     const patchedUsable =
+      patchedAdaptiveClassicOk ||
       patchedProgressiveFallbackOk ||
       playerSummaryIsUsable(patchedSummary);
 
@@ -1638,7 +1862,12 @@ yt-source-swap-test.js text/javascript
       adStateBeforeStrip,
       adStateAfterStrip,
       classicPatchMode: config.classicPatchMode,
-      progressiveAutoSelection: targetPlayer.sourceSwapSelection || null,
+      progressiveAutoSelection: config.classicPatchMode === "mweb-progressive-auto"
+        ? targetPlayer.sourceSwapSelection || null
+        : null,
+      adaptiveClassicSelection: config.classicPatchMode === "webcreator-adaptive-classic-auto"
+        ? targetPlayer.sourceSwapSelection || null
+        : null,
       rawCipherCandidate: hasProgressiveRawCipherCandidate(targetPlayer.value.streamingData),
       playableProgressiveCandidate: hasPlayableProgressiveCandidate(targetPlayer.value.streamingData),
       acceptedBy: targetPlayer.acceptedBy || "",
@@ -1652,7 +1881,12 @@ yt-source-swap-test.js text/javascript
       targetSelectionMode,
       classicPatchMode: config.classicPatchMode,
       patchPolicy: config.patchPolicy,
-      progressiveAutoSelection: targetPlayer.sourceSwapSelection || null,
+      progressiveAutoSelection: config.classicPatchMode === "mweb-progressive-auto"
+        ? targetPlayer.sourceSwapSelection || null
+        : null,
+      adaptiveClassicSelection: config.classicPatchMode === "webcreator-adaptive-classic-auto"
+        ? targetPlayer.sourceSwapSelection || null
+        : null,
     };
 
     const patchSnapshot = cloneJson(lastPatch);
@@ -2176,6 +2410,16 @@ yt-source-swap-test.js text/javascript
       config.endpoints.getWatch = true;
       config.endpoints.next = false;
       console.log("[yt-source-swap] using ad-state-only mweb fallback");
+    },
+
+    useWebCreatorAdaptive() {
+      config.targetProfile = "webCreator";
+      config.classicPatchMode = "webcreator-adaptive-classic-auto";
+      config.patchPolicy = "always";
+      config.endpoints.player = false;
+      config.endpoints.getWatch = true;
+      config.endpoints.next = false;
+      console.log("[yt-source-swap] using WEB_CREATOR adaptive classic fallback");
     },
 
     copyEvents() {
