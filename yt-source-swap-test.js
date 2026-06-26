@@ -17,13 +17,30 @@ yt-source-swap-test.js text/javascript
   const events = [];
   const maxEvents = 250;
 
+  const CLIENT_PROFILES = {
+    oldWeb: {
+      key: "oldWeb",
+      clientName: "WEB",
+      clientVersion: "1.20160315",
+      clientHeaderName: "1",
+    },
+
+    webRemix: {
+      key: "webRemix",
+      clientName: "WEB_REMIX",
+      clientVersion: "1.20260623.13.00",
+      clientHeaderName: "67",
+    },
+  };
+
   const config = {
     enabled: true,
-    targetVersion: "1.20160315",
+    targetProfile: "webRemix",
     requireNonSabr: true,
     requireStreamingDataProof: true,
     logVerbose: true,
     logIgnoredYoutubei: true,
+    logMediaErrors: true,
     interceptFetch: true,
     interceptXhr: true,
     endpoints: {
@@ -111,6 +128,53 @@ yt-source-swap-test.js text/javascript
       bodyJson?.continuation ||
       ""
     );
+  }
+
+  function isMediaUrl(url) {
+    return /googlevideo\.com\/videoplayback/i.test(String(url || ""));
+  }
+
+  function summarizeMediaUrl(url) {
+    try {
+      const u = new URL(String(url));
+      return {
+        host: u.hostname,
+        path: u.pathname,
+        itag: u.searchParams.get("itag") || "",
+        mime: u.searchParams.get("mime") || "",
+        c: u.searchParams.get("c") || "",
+        hasSabr: /(?:[?&]|%26)sabr(?:=|%3D)1/i.test(String(url)),
+        hasRange: /(?:[?&]|%26)range(?:=|%3D)/i.test(String(url)),
+        urlStart: String(url).slice(0, 260),
+      };
+    } catch {
+      return {
+        urlStart: String(url).slice(0, 260),
+      };
+    }
+  }
+
+  function playerEndpointUrl() {
+    return `${location.origin}/youtubei/v1/player?prettyPrint=false`;
+  }
+
+  function buildPlayerReplayFromContainerBody(bodyJson) {
+    if (!bodyJson?.playerRequest || typeof bodyJson.playerRequest !== "object") {
+      return null;
+    }
+
+    const playerBody = cloneJson(bodyJson.playerRequest);
+
+    if (!playerBody.context) {
+      playerBody.context = cloneJson(bodyJson.context || {});
+    }
+
+    if (!playerBody.context?.client && bodyJson.context?.client) {
+      playerBody.context = playerBody.context || {};
+      playerBody.context.client = cloneJson(bodyJson.context.client);
+    }
+
+    return playerBody;
   }
 
   function stripPlayerAdState(playerResponse) {
@@ -296,7 +360,24 @@ yt-source-swap-test.js text/javascript
     return out;
   }
 
-  function makeReplayHeaders(originalHeaders, bodyJson, { gzip, versionOverride }) {
+  function getTargetProfile() {
+    return CLIENT_PROFILES[config.targetProfile] || CLIENT_PROFILES.webRemix;
+  }
+
+  function applyClientProfile(bodyJson, profile = getTargetProfile()) {
+    const body = cloneJson(bodyJson);
+
+    if (!body?.context?.client) {
+      throw new Error("No context.client in youtubei body");
+    }
+
+    body.context.client.clientName = profile.clientName;
+    body.context.client.clientVersion = profile.clientVersion;
+
+    return body;
+  }
+
+  function makeReplayHeaders(originalHeaders, bodyJson, { gzip, profile = getTargetProfile() }) {
     const headers = new Headers();
 
     for (const [key, value] of Object.entries(originalHeaders || {})) {
@@ -333,8 +414,8 @@ yt-source-swap-test.js text/javascript
 
     const client = bodyJson?.context?.client || {};
 
-    headers.set("x-youtube-client-name", "1");
-    headers.set("x-youtube-client-version", versionOverride || client.clientVersion || config.targetVersion);
+    headers.set("x-youtube-client-name", profile.clientHeaderName);
+    headers.set("x-youtube-client-version", profile.clientVersion);
 
     if (client.visitorData && !headers.has("x-goog-visitor-id")) {
       headers.set("x-goog-visitor-id", client.visitorData);
@@ -513,9 +594,22 @@ yt-source-swap-test.js text/javascript
     return found;
   }
 
-  function findBestUsablePlayerObject(root) {
-    const matches = findPlayerLikeObjects(root);
-    return matches.find(p => playerSummaryIsUsable(p.summary)) || null;
+  function getPlayerVideoId(playerObj) {
+    return playerObj?.videoDetails?.videoId || "";
+  }
+
+  function findBestUsablePlayerObjectForVideo(root, wantedVideoId = "") {
+    const matches = findPlayerLikeObjects(root)
+      .filter(p => playerSummaryIsUsable(p.summary));
+
+    if (!matches.length) return null;
+
+    if (wantedVideoId) {
+      const exact = matches.find(p => getPlayerVideoId(p.value) === wantedVideoId);
+      if (exact) return exact;
+    }
+
+    return matches[0];
   }
 
   function findFirstModernPlayerObject(root) {
@@ -548,7 +642,7 @@ yt-source-swap-test.js text/javascript
       statusText: "OK",
       headers: {
         "content-type": "application/json; charset=utf-8",
-        "x-chroma-source-swap": "web-old-version",
+        "x-chroma-source-swap": "target-client",
       },
     });
   }
@@ -579,8 +673,12 @@ yt-source-swap-test.js text/javascript
     const client = meta.bodyJson?.context?.client;
 
     if (!client) return [false, "no-client"];
+    const profile = getTargetProfile();
+
     if (client.clientName !== "WEB") return [false, `client-${client.clientName || "missing"}`];
-    if (client.clientVersion === config.targetVersion) return [false, "already-target-version"];
+    if (client.clientName === profile.clientName && client.clientVersion === profile.clientVersion) {
+      return [false, "already-target-client"];
+    }
 
     if (endpoint === "player" && !meta.bodyJson.videoId) {
       return [false, "no-video-id"];
@@ -612,16 +710,12 @@ yt-source-swap-test.js text/javascript
     });
   }
 
-  async function fetchOldWebEndpoint(meta) {
-    const swappedBody = cloneJson(meta.bodyJson);
-
-    if (!swappedBody?.context?.client) {
-      throw new Error("No context.client in youtubei body");
-    }
-
-    swappedBody.context.client.clientName = "WEB";
-    swappedBody.context.client.clientVersion = config.targetVersion;
-
+  async function fetchTargetClientEndpoint(meta, options = {}) {
+    const profile = getTargetProfile();
+    const sourceMode = options.sourceMode || "same-endpoint";
+    const targetUrl = options.url || meta.url;
+    const sourceBodyJson = options.bodyJson || meta.bodyJson;
+    const swappedBody = applyClientProfile(sourceBodyJson, profile);
     const bodyText = JSON.stringify(swappedBody);
 
     let gzip = true;
@@ -634,12 +728,21 @@ yt-source-swap-test.js text/javascript
 
     const headers = makeReplayHeaders(meta.rawHeaders, swappedBody, {
       gzip,
-      versionOverride: config.targetVersion,
+      profile,
     });
 
     const started = performance.now();
 
-    const resp = await nativeFetch(meta.url, {
+    log("replaying target client endpoint", {
+      endpoint: endpointForUrl(targetUrl),
+      sourceMode,
+      targetProfile: profile.key,
+      targetClientName: profile.clientName,
+      targetClientVersion: profile.clientVersion,
+      targetClientHeaderName: profile.clientHeaderName,
+    });
+
+    const resp = await nativeFetch(targetUrl, {
       method: "POST",
       headers,
       body,
@@ -655,7 +758,12 @@ yt-source-swap-test.js text/javascript
     const endpointSummary = summarizeEndpointResponse(json);
 
     return {
-      endpoint: meta.endpoint || endpointForUrl(meta.url),
+      endpoint: endpointForUrl(targetUrl),
+      sourceMode,
+      targetProfile: profile.key,
+      targetClientName: profile.clientName,
+      targetClientVersion: profile.clientVersion,
+      targetClientHeaderName: profile.clientHeaderName,
       httpStatus: resp.status,
       ok: resp.ok,
       durationMs: Math.round(performance.now() - started),
@@ -703,12 +811,16 @@ yt-source-swap-test.js text/javascript
       requestVideoId: getBodyVideoId(meta.bodyJson),
       originalClientName: meta.bodyJson?.context?.client?.clientName || "",
       originalClientVersion: meta.bodyJson?.context?.client?.clientVersion || "",
-      targetVersion: config.targetVersion,
+      targetProfile: getTargetProfile().key,
+      targetClientName: getTargetProfile().clientName,
+      targetClientVersion: getTargetProfile().clientVersion,
+      targetClientHeaderName: getTargetProfile().clientHeaderName,
       bodyType: meta.bodyType,
       bodyTextLength: meta.bodyTextLength,
       topKeys: meta.bodyJson ? Object.keys(meta.bodyJson).slice(0, 40) : [],
     });
 
+    const wantedVideoId = getBodyVideoId(meta.bodyJson);
     const originalResp = await nativeFetch(input, init);
     const originalText = await originalResp.clone().text();
     const originalJson = safeJson(originalText);
@@ -720,43 +832,80 @@ yt-source-swap-test.js text/javascript
         event: "fallback-container-patch",
         transport: meta.transport,
         endpoint,
-        pageVideoId: getCurrentPageVideoId(),
         reason: counters.lastReason,
+        sourceMode: "",
+        targetProfile: getTargetProfile().key,
+        targetClientName: getTargetProfile().clientName,
+        targetClientVersion: getTargetProfile().clientVersion,
+        targetHttpStatus: 0,
+        targetNestedPlayerCount: 0,
+        targetBestUsable: false,
+        requestVideoId: wantedVideoId,
+        pageVideoId: getCurrentPageVideoId(),
+        targetBestPath: "",
+        modernPath: "",
         httpStatus: originalResp.status,
       });
       return originalResp;
     }
 
-    const oldResult = await fetchOldWebEndpoint(meta);
-    const oldPlayer = findBestUsablePlayerObject(oldResult.json);
+    let targetResult = await fetchTargetClientEndpoint(meta, {
+      sourceMode: "same-endpoint",
+    });
+    let targetPlayer = findBestUsablePlayerObjectForVideo(targetResult.json, wantedVideoId);
+
+    if (!targetPlayer && endpoint === "get_watch") {
+      const playerBody = buildPlayerReplayFromContainerBody(meta.bodyJson);
+
+      if (playerBody) {
+        const playerResult = await fetchTargetClientEndpoint(meta, {
+          sourceMode: "player-from-container",
+          url: playerEndpointUrl(),
+          bodyJson: playerBody,
+        });
+
+        const playerTarget = findBestUsablePlayerObjectForVideo(playerResult.json, wantedVideoId);
+
+        if (playerTarget) {
+          targetResult = playerResult;
+          targetPlayer = playerTarget;
+        }
+      }
+    }
+
     const modernPlayer = findFirstModernPlayerObject(originalJson);
 
-    if (!oldResult.ok || !oldPlayer || !modernPlayer?.value) {
+    if (!targetResult.ok || !targetPlayer || !modernPlayer?.value) {
       counters.fallback++;
-      counters.lastReason = "no-usable-old-player-for-container-patch";
+      counters.lastReason = "no-usable-target-player-for-container-patch";
 
       remember({
         event: "fallback-container-patch",
         transport: meta.transport,
         endpoint,
-        pageVideoId: getCurrentPageVideoId(),
         reason: counters.lastReason,
-        oldHttpStatus: oldResult.httpStatus,
-        oldNestedPlayerCount: oldResult.endpointSummary?.nestedPlayerCount || 0,
-        oldBestUsable: !!oldPlayer,
+        sourceMode: targetResult?.sourceMode || "",
+        targetProfile: targetResult?.targetProfile || getTargetProfile().key,
+        targetClientName: targetResult?.targetClientName || getTargetProfile().clientName,
+        targetClientVersion: targetResult?.targetClientVersion || getTargetProfile().clientVersion,
+        targetHttpStatus: targetResult?.httpStatus || 0,
+        targetNestedPlayerCount: targetResult?.endpointSummary?.nestedPlayerCount || 0,
+        targetBestUsable: !!targetPlayer,
+        requestVideoId: wantedVideoId,
+        pageVideoId: getCurrentPageVideoId(),
         modernHasPlayer: !!modernPlayer,
-        oldBestPath: oldPlayer?.path || "",
+        targetBestPath: targetPlayer?.path || "",
         modernPath: modernPlayer?.path || "",
       });
 
       return originalResp;
     }
 
-    // Patch only streamingData — do not copy old playerResponse wholesale.
-    modernPlayer.value.streamingData = cloneJson(oldPlayer.value.streamingData);
+    // Patch only streamingData; do not copy the target playerResponse wholesale.
+    modernPlayer.value.streamingData = cloneJson(targetPlayer.value.streamingData);
 
     // Strip ad state from the patched modern playerResponse to avoid
-    // inconsistent state: modern ad-eligible object + old non-SABR stream.
+    // inconsistent state: modern ad-eligible object + target non-SABR stream.
     const adStateBeforeStrip = summarizeAdState(modernPlayer.value);
     stripPlayerAdState(modernPlayer.value);
     const adStateAfterStrip = summarizeAdState(modernPlayer.value);
@@ -765,7 +914,11 @@ yt-source-swap-test.js text/javascript
 
     // Require the patch to be usable AND ad-state to be fully clean.
     if (
+      !targetResult.ok ||
+      !targetPlayer ||
+      !modernPlayer?.value ||
       !playerSummaryIsUsable(patchedSummary) ||
+      patchedSummary.hasSabr ||
       adStateAfterStrip.playerAds !== 0 ||
       adStateAfterStrip.adSlots !== 0 ||
       adStateAfterStrip.hasAdBreakHeartbeatParams
@@ -777,9 +930,18 @@ yt-source-swap-test.js text/javascript
         event: "fallback-container-patch",
         transport: meta.transport,
         endpoint,
-        pageVideoId: getCurrentPageVideoId(),
         reason: counters.lastReason,
-        oldPath: oldPlayer.path,
+        sourceMode: targetResult?.sourceMode || "",
+        targetProfile: targetResult?.targetProfile || getTargetProfile().key,
+        targetClientName: targetResult?.targetClientName || getTargetProfile().clientName,
+        targetClientVersion: targetResult?.targetClientVersion || getTargetProfile().clientVersion,
+        targetHttpStatus: targetResult?.httpStatus || 0,
+        targetNestedPlayerCount: targetResult?.endpointSummary?.nestedPlayerCount || 0,
+        targetBestUsable: !!targetPlayer,
+        requestVideoId: wantedVideoId,
+        pageVideoId: getCurrentPageVideoId(),
+        targetBestPath: targetPlayer?.path || "",
+        targetPath: targetPlayer?.path || "",
         modernPath: modernPlayer.path,
         adStateBeforeStrip,
         adStateAfterStrip,
@@ -800,13 +962,20 @@ yt-source-swap-test.js text/javascript
       event: "container-patch",
       transport: meta.transport,
       endpoint,
+      sourceMode: targetResult.sourceMode,
+      targetProfile: targetResult.targetProfile,
+      targetClientName: targetResult.targetClientName,
+      targetClientVersion: targetResult.targetClientVersion,
+      targetClientHeaderName: targetResult.targetClientHeaderName,
+      requestVideoId: wantedVideoId,
       pageVideoId: getCurrentPageVideoId(),
-      requestVideoId: getBodyVideoId(meta.bodyJson),
-      oldPath: oldPlayer.path,
+      targetHttpStatus: targetResult.httpStatus,
+      targetDurationMs: targetResult.durationMs,
+      targetPath: targetPlayer.path,
       modernPath: modernPlayer.path,
       adStateBeforeStrip,
       adStateAfterStrip,
-      oldSummary: oldPlayer.summary,
+      targetSummary: targetPlayer.summary,
       patchedSummary,
     });
 
@@ -845,13 +1014,16 @@ yt-source-swap-test.js text/javascript
       videoId: meta.bodyJson?.videoId || "",
       originalClientName: meta.bodyJson?.context?.client?.clientName || "",
       originalClientVersion: meta.bodyJson?.context?.client?.clientVersion || "",
-      targetVersion: config.targetVersion,
+      targetProfile: getTargetProfile().key,
+      targetClientName: getTargetProfile().clientName,
+      targetClientVersion: getTargetProfile().clientVersion,
+      targetClientHeaderName: getTargetProfile().clientHeaderName,
       bodyType: meta.bodyType,
       bodyTextLength: meta.bodyTextLength,
       topKeys: meta.bodyJson ? Object.keys(meta.bodyJson).slice(0, 40) : [],
     });
 
-    const result = await fetchOldWebEndpoint(meta);
+    const result = await fetchTargetClientEndpoint(meta);
     const ok = validReplacement(result);
 
     remember({
@@ -862,6 +1034,11 @@ yt-source-swap-test.js text/javascript
       httpStatus: result.httpStatus,
       durationMs: result.durationMs,
       gzip: result.gzip,
+      sourceMode: result.sourceMode,
+      targetProfile: result.targetProfile,
+      targetClientName: result.targetClientName,
+      targetClientVersion: result.targetClientVersion,
+      targetClientHeaderName: result.targetClientHeaderName,
       summary: result.summary,
       endpointSummary: {
         directUsable: result.endpointSummary?.directUsable || false,
@@ -916,6 +1093,36 @@ yt-source-swap-test.js text/javascript
     }
 
     try {
+      const rawUrl =
+        input instanceof Request
+          ? input.url
+          : typeof input === "string" || input instanceof URL
+            ? String(input)
+            : String(input?.url || "");
+
+      if (config.logMediaErrors && isMediaUrl(rawUrl)) {
+        const resp = await nativeFetch.apply(this, arguments);
+
+        if (!resp.ok) {
+          remember({
+            event: "media-error",
+            status: resp.status,
+            statusText: resp.statusText,
+            targetProfile: getTargetProfile().key,
+            ...summarizeMediaUrl(rawUrl),
+          });
+        } else {
+          remember({
+            event: "media-ok",
+            status: resp.status,
+            targetProfile: getTargetProfile().key,
+            ...summarizeMediaUrl(rawUrl),
+          });
+        }
+
+        return resp;
+      }
+
       meta = await readFetchMeta(input, init);
 
       counters.seen++;
@@ -998,7 +1205,7 @@ yt-source-swap-test.js text/javascript
     const responseText = result.responseText || JSON.stringify(result.json || {});
     const responseHeaders = [
       "content-type: application/json; charset=utf-8",
-      "x-chroma-source-swap: web-old-version",
+      "x-chroma-source-swap: target-client",
     ].join("\r\n");
 
     const state = {
@@ -1038,7 +1245,7 @@ yt-source-swap-test.js text/javascript
       xhr.getResponseHeader = function getResponseHeader(name) {
         const lower = String(name || "").toLowerCase();
         if (lower === "content-type") return "application/json; charset=utf-8";
-        if (lower === "x-chroma-source-swap") return "web-old-version";
+        if (lower === "x-chroma-source-swap") return "target-client";
         return null;
       };
 
@@ -1165,6 +1372,7 @@ yt-source-swap-test.js text/javascript
 
   g.__YT_SOURCE_SWAP_TEST__ = {
     config,
+    CLIENT_PROFILES,
     counters,
     events,
 
