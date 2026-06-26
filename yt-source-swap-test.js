@@ -1215,6 +1215,8 @@ yt-source-swap-test.js text/javascript
     } catch {}
   }
 
+  clearPersistedHybridHandoff();
+
   function persistHybridHandoff(videoId, resumeAt) {
     if (!videoId) return;
 
@@ -1502,8 +1504,7 @@ yt-source-swap-test.js text/javascript
 
       clearHybridHandoffTimer();
 
-      hybridState.handoffInProgress = true;
-      markHybridHandoffAttempted(videoId);
+      hybridState.handoffInProgress = false;
 
       remember({
         event: "web-warmup-ready",
