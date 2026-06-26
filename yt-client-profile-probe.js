@@ -18,12 +18,14 @@ yt-client-profile-probe.js text/javascript
   const maxEvents = 500;
 
   let lastProbeSeed = null;
+  let lastProbeResults = [];
 
   const config = {
     enabled: true,
     logIgnoredYoutubei: false,
     interceptFetch: true,
     interceptXhr: true,
+    maxSeedAgeMs: 300000,
     captureEndpoints: {
       getWatch: true,
       player: false,
@@ -894,7 +896,7 @@ yt-client-profile-probe.js text/javascript
   // Probe one profile
   // ---------------------------------------------------------------------------
 
-  function lastSeedIsFresh(maxAgeMs = 60000) {
+  function lastSeedIsFresh(maxAgeMs = config.maxSeedAgeMs) {
     return (
       !!lastProbeSeed?.bodyJson &&
       Number.isFinite(lastProbeSeed.time) &&
@@ -999,7 +1001,70 @@ yt-client-profile-probe.js text/javascript
       }
     }
 
+    lastProbeResults = out.slice();
     return out;
+  }
+
+  function summarizeProbeResults(results = lastProbeResults) {
+    return results
+      .filter(result => result?.event === "probe-profile-result")
+      .map(result => ({
+        profile: result.profileKey,
+        http: result.httpStatus,
+        ok: result.ok,
+        status: result.status,
+        reason: result.reason,
+        formats: result.formats,
+        adaptiveFormats: result.adaptiveFormats,
+        maxHeight: result.maxHeight,
+
+        progressiveCount: result.progressive?.usableCount || 0,
+        progressiveBest: result.progressive?.best
+          ? {
+              itag: result.progressive.best.itag,
+              qualityLabel: result.progressive.best.qualityLabel,
+              mode: result.progressive.best.mode,
+            }
+          : null,
+
+        adaptiveVideoCount: result.adaptiveClassic?.usableVideoCount || 0,
+        adaptiveAudioCount: result.adaptiveClassic?.usableAudioCount || 0,
+        hasPlayablePair: !!result.adaptiveClassic?.hasPlayablePair,
+
+        bestVideo: result.adaptiveClassic?.bestVideo
+          ? {
+              itag: result.adaptiveClassic.bestVideo.itag,
+              qualityLabel: result.adaptiveClassic.bestVideo.qualityLabel,
+              height: result.adaptiveClassic.bestVideo.height,
+              mode: result.adaptiveClassic.bestVideo.mode,
+            }
+          : null,
+
+        bestAudio: result.adaptiveClassic?.bestAudio
+          ? {
+              itag: result.adaptiveClassic.bestAudio.itag,
+              mimeType: result.adaptiveClassic.bestAudio.mimeType,
+              bitrate: result.adaptiveClassic.bestAudio.bitrate,
+              mode: result.adaptiveClassic.bestAudio.mode,
+            }
+          : null,
+      }));
+  }
+
+  async function runCoreProbe() {
+    const results = await runProbeProfiles([
+      "mwebCurrent",
+      "mwebOld1",
+      "webEmbeddedCurrent",
+      "tvHtml5Current",
+      "tvHtml5SimplyEmbedded",
+      "webCreator",
+      "webCreatorCurrentLike",
+    ], { delayMs: 1000 });
+
+    const summary = summarizeProbeResults(results);
+    console.table(summary);
+    return summary;
   }
 
   // ---------------------------------------------------------------------------
@@ -1051,6 +1116,26 @@ yt-client-profile-probe.js text/javascript
 
     async probeProfiles(profileInputs, options) {
       return await runProbeProfiles(profileInputs, options);
+    },
+
+    lastResults() {
+      return lastProbeResults.slice();
+    },
+
+    summary(results) {
+      const summary = summarizeProbeResults(results || lastProbeResults);
+      console.table(summary);
+      return summary;
+    },
+
+    async runCoreProbe() {
+      return await runCoreProbe();
+    },
+
+    copySummary() {
+      const summary = summarizeProbeResults(lastProbeResults);
+      copy(JSON.stringify(summary, null, 2));
+      console.log(`[yt-client-profile-probe] copied ${summary.length} summarized probe result(s)`);
     },
 
     clear() {
