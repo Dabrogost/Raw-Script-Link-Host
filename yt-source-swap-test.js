@@ -23,6 +23,7 @@ yt-source-swap-test.js text/javascript
       clientName: "WEB",
       clientVersion: "1.20160315",
       clientHeaderName: "1",
+      notes: "Known non-SABR but media 403s",
     },
 
     webRemix: {
@@ -30,12 +31,37 @@ yt-source-swap-test.js text/javascript
       clientName: "WEB_REMIX",
       clientVersion: "1.20260623.13.00",
       clientHeaderName: "67",
+      notes: "No streamingData from www.youtube.com replay so far",
+    },
+
+    mweb: {
+      key: "mweb",
+      clientName: "MWEB",
+      clientVersion: "2.20260625.01.00",
+      clientHeaderName: "2",
+      notes: "First non-WEB_REMIX candidate",
+    },
+
+    webEmbedded: {
+      key: "webEmbedded",
+      clientName: "WEB_EMBEDDED_PLAYER",
+      clientVersion: "2.20260625.01.00",
+      clientHeaderName: "56",
+      notes: "Candidate header/version; must be console-editable",
+    },
+
+    tvHtml5: {
+      key: "tvHtml5",
+      clientName: "TVHTML5",
+      clientVersion: "7.20260625.00.00",
+      clientHeaderName: "7",
+      notes: "Candidate version; must be console-editable",
     },
   };
 
   const config = {
     enabled: true,
-    targetProfile: "webRemix",
+    targetProfile: "mweb",
     requireNonSabr: true,
     requireStreamingDataProof: true,
     logVerbose: true,
@@ -368,7 +394,7 @@ yt-source-swap-test.js text/javascript
   }
 
   function getTargetProfile() {
-    return CLIENT_PROFILES[config.targetProfile] || CLIENT_PROFILES.webRemix;
+    return CLIENT_PROFILES[config.targetProfile] || CLIENT_PROFILES.mweb;
   }
 
   function applyClientProfile(bodyJson, profile = getTargetProfile()) {
@@ -1423,9 +1449,20 @@ yt-source-swap-test.js text/javascript
 
   g.__YT_SOURCE_SWAP_TEST__ = {
     config,
-    CLIENT_PROFILES,
+    profiles: CLIENT_PROFILES,
     counters,
     events,
+
+    setProfile(key) {
+      if (!CLIENT_PROFILES[key]) {
+        console.warn("[yt-source-swap] unknown profile", key, Object.keys(CLIENT_PROFILES));
+        return false;
+      }
+
+      config.targetProfile = key;
+      console.log("[yt-source-swap] target profile set", key, CLIENT_PROFILES[key]);
+      return true;
+    },
 
     stats() {
       return {
