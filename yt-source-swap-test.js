@@ -76,6 +76,13 @@ yt-source-swap-test.js text/javascript
     lastEndpoint: "",
   };
 
+  let lastPatch = {
+    time: 0,
+    targetProfile: "",
+    sourceMode: "",
+    requestVideoId: "",
+  };
+
   function log(...args) {
     if (config.logVerbose) {
       console.log("%c[yt-source-swap]", "font-weight:bold;color:#2b7", ...args);
@@ -854,8 +861,19 @@ yt-source-swap-test.js text/javascript
     });
     let targetPlayer = findBestUsablePlayerObjectForVideo(targetResult.json, wantedVideoId);
 
-    if (!targetPlayer && endpoint === "get_watch") {
+    if (!targetPlayer && endpoint === "get_watch" && meta.bodyJson?.playerRequest) {
       const playerBody = buildPlayerReplayFromContainerBody(meta.bodyJson);
+
+      remember({
+        event: "attempt-target-player-from-container",
+        transport: meta.transport,
+        endpoint,
+        targetProfile: getTargetProfile().key,
+        requestVideoId: wantedVideoId,
+        pageVideoId: getCurrentPageVideoId(),
+        hasPlayerBody: !!playerBody,
+        playerBodyTopKeys: playerBody ? Object.keys(playerBody).slice(0, 40) : [],
+      });
 
       if (playerBody) {
         const playerResult = await fetchTargetClientEndpoint(meta, {
@@ -865,6 +883,24 @@ yt-source-swap-test.js text/javascript
         });
 
         const playerTarget = findBestUsablePlayerObjectForVideo(playerResult.json, wantedVideoId);
+
+        remember({
+          event: "target-player-from-container-result",
+          transport: meta.transport,
+          endpoint,
+          sourceMode: playerResult.sourceMode,
+          targetProfile: playerResult.targetProfile,
+          targetClientName: playerResult.targetClientName,
+          targetClientVersion: playerResult.targetClientVersion,
+          targetClientHeaderName: playerResult.targetClientHeaderName,
+          targetHttpStatus: playerResult.httpStatus,
+          targetNestedPlayerCount: playerResult.endpointSummary?.nestedPlayerCount || 0,
+          targetBestUsable: !!playerTarget,
+          targetBestPath: playerTarget?.path || "",
+          targetSummary: playerTarget?.summary || null,
+          textPreview: playerResult.textPreview || "",
+          topKeys: playerResult.json ? Object.keys(playerResult.json).slice(0, 80) : [],
+        });
 
         if (playerTarget) {
           targetResult = playerResult;
@@ -978,6 +1014,13 @@ yt-source-swap-test.js text/javascript
       targetSummary: targetPlayer.summary,
       patchedSummary,
     });
+
+    lastPatch = {
+      time: performance.now(),
+      targetProfile: targetResult.targetProfile,
+      sourceMode: targetResult.sourceMode,
+      requestVideoId: wantedVideoId,
+    };
 
     return makeJsonResponseFromOriginal(originalResp, originalJson);
   }
@@ -1102,20 +1145,28 @@ yt-source-swap-test.js text/javascript
 
       if (config.logMediaErrors && isMediaUrl(rawUrl)) {
         const resp = await nativeFetch.apply(this, arguments);
+        const recentPatchAgeMs = performance.now() - lastPatch.time;
+        const maybeFromPatch = recentPatchAgeMs >= 0 && recentPatchAgeMs < 15000;
 
         if (!resp.ok) {
           remember({
             event: "media-error",
             status: resp.status,
             statusText: resp.statusText,
-            targetProfile: getTargetProfile().key,
+            activeTargetProfile: getTargetProfile().key,
+            maybeFromPatch,
+            recentPatchAgeMs: Math.round(recentPatchAgeMs),
+            recentPatch: maybeFromPatch ? lastPatch : null,
             ...summarizeMediaUrl(rawUrl),
           });
         } else {
           remember({
             event: "media-ok",
             status: resp.status,
-            targetProfile: getTargetProfile().key,
+            activeTargetProfile: getTargetProfile().key,
+            maybeFromPatch,
+            recentPatchAgeMs: Math.round(recentPatchAgeMs),
+            recentPatch: maybeFromPatch ? lastPatch : null,
             ...summarizeMediaUrl(rawUrl),
           });
         }
