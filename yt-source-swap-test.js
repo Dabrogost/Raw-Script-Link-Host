@@ -71,6 +71,7 @@ yt-source-swap-test.js text/javascript
     interceptXhr: true,
     allowClassicOnlyFromSabrTargets: true,
     classicPatchMode: "progressive-only",
+    allowCipherUrlWithoutDecipher: false,
     endpoints: {
       player: false,
       getWatch: true,
@@ -683,6 +684,79 @@ yt-source-swap-test.js text/javascript
     return matches[0] || null;
   }
 
+  function parseCipherString(cipher) {
+    const params = new URLSearchParams(String(cipher || ""));
+
+    return {
+      hasCipher: !!cipher,
+      url: params.get("url") || "",
+      s: params.get("s") || "",
+      sp: params.get("sp") || "",
+      sig: params.get("sig") || "",
+      signature: params.get("signature") || "",
+      rawStart: String(cipher || "").slice(0, 300),
+    };
+  }
+
+  function summarizeFormatEntry(format) {
+    const cipher = format?.signatureCipher || format?.cipher || "";
+    const parsedCipher = parseCipherString(cipher);
+    const directUrl = format?.url || "";
+
+    let directUrlInfo = null;
+    let cipherUrlInfo = null;
+
+    try {
+      if (directUrl) {
+        const u = new URL(directUrl);
+        directUrlInfo = {
+          host: u.hostname,
+          itag: u.searchParams.get("itag") || "",
+          mime: u.searchParams.get("mime") || "",
+          c: u.searchParams.get("c") || "",
+          hasSabr: /(?:[?&]|%26)sabr(?:=|%3D)1/i.test(directUrl),
+          urlStart: directUrl.slice(0, 260),
+        };
+      }
+    } catch {}
+
+    try {
+      if (parsedCipher.url) {
+        const u = new URL(parsedCipher.url);
+        cipherUrlInfo = {
+          host: u.hostname,
+          itag: u.searchParams.get("itag") || "",
+          mime: u.searchParams.get("mime") || "",
+          c: u.searchParams.get("c") || "",
+          hasSabr: /(?:[?&]|%26)sabr(?:=|%3D)1/i.test(parsedCipher.url),
+          urlStart: parsedCipher.url.slice(0, 260),
+        };
+      }
+    } catch {}
+
+    return {
+      itag: format?.itag || "",
+      mimeType: format?.mimeType || "",
+      quality: format?.quality || "",
+      qualityLabel: format?.qualityLabel || "",
+      hasUrl: !!directUrl,
+      hasSignatureCipher: !!format?.signatureCipher,
+      hasCipher: !!format?.cipher,
+      directUrlInfo,
+      cipher: {
+        hasCipher: parsedCipher.hasCipher,
+        hasUrl: !!parsedCipher.url,
+        hasS: !!parsedCipher.s,
+        sLength: parsedCipher.s.length,
+        sp: parsedCipher.sp,
+        hasSig: !!parsedCipher.sig,
+        hasSignature: !!parsedCipher.signature,
+        cipherUrlInfo,
+        rawStart: parsedCipher.rawStart,
+      },
+    };
+  }
+
   function summarizeStreamingDataUrls(streamingData) {
     const formats = Array.isArray(streamingData?.formats) ? streamingData.formats : [];
     const adaptiveFormats = Array.isArray(streamingData?.adaptiveFormats) ? streamingData.adaptiveFormats : [];
@@ -702,6 +776,8 @@ yt-source-swap-test.js text/javascript
 
     const classicUrlCount = directUrls.length - sabrUrlCount;
 
+    const sampleFormats = all.slice(0, 8).map(summarizeFormatEntry);
+
     return {
       formats: formats.length,
       adaptiveFormats: adaptiveFormats.length,
@@ -713,6 +789,7 @@ yt-source-swap-test.js text/javascript
       hasAnyClassicUrl: classicUrlCount > 0,
       sampleClassic: directUrls.find(u => !/(?:[?&]|%26)sabr(?:=|%3D)1/i.test(String(u)))?.slice(0, 240) || "",
       sampleSabr: directUrls.find(u => /(?:[?&]|%26)sabr(?:=|%3D)1/i.test(String(u)))?.slice(0, 240) || "",
+      sampleFormats,
     };
   }
 
@@ -747,11 +824,55 @@ yt-source-swap-test.js text/javascript
     return clean;
   }
 
+  function cloneProgressiveCipherUrlOnlyStreamingData(streamingData) {
+    const clean = cloneJson(streamingData || {});
+
+    delete clean.serverAbrStreamingUrl;
+    delete clean.sabrStreamingUrl;
+    delete clean.serverAbrStreamingUrlConfig;
+
+    const formats = Array.isArray(clean.formats) ? clean.formats : [];
+
+    clean.formats = formats
+      .map(format => {
+        if (format.url && hasDirectClassicUrl(format)) {
+          return format;
+        }
+
+        const cipher = format.signatureCipher || format.cipher || "";
+        const parsed = parseCipherString(cipher);
+
+        if (!parsed.url) return null;
+
+        const sigValue = parsed.sig || parsed.signature || "";
+        const sigParam = parsed.sp || "signature";
+
+        if (!sigValue) return null;
+
+        const url = new URL(parsed.url);
+
+        url.searchParams.set(sigParam, sigValue);
+
+        const cloned = cloneJson(format);
+        cloned.url = url.toString();
+        delete cloned.signatureCipher;
+        delete cloned.cipher;
+        return cloned;
+      })
+      .filter(Boolean);
+
+    clean.adaptiveFormats = [];
+
+    return clean;
+  }
+
   function makeSyntheticPlayerWithStreamingData(basePlayer, streamingData) {
     const cloned = cloneJson(basePlayer || {});
 
     if (config.classicPatchMode === "progressive-only") {
       cloned.streamingData = cloneProgressiveOnlyStreamingData(streamingData);
+    } else if (config.classicPatchMode === "progressive-cipher-url-only") {
+      cloned.streamingData = cloneProgressiveCipherUrlOnlyStreamingData(streamingData);
     } else {
       cloned.streamingData = cloneClassicOnlyStreamingData(streamingData);
     }
