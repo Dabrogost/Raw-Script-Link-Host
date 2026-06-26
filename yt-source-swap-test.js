@@ -81,6 +81,12 @@ yt-source-swap-test.js text/javascript
     classicPatchMode: "mweb-progressive-auto",
     allowCipherUrlWithoutDecipher: false,
     patchPolicy: "always",
+    hybridStartup: {
+      enabled: false,
+      handoffAtSeconds: 5,
+      handoffCooldownMs: 30000,
+      reloadMethod: "location-replace",
+    },
     endpoints: {
       player: false,
       getWatch: true,
@@ -119,6 +125,14 @@ yt-source-swap-test.js text/javascript
     targetProfile: "",
     sourceMode: "",
     requestVideoId: "",
+  };
+
+  const hybridState = {
+    handoffAttemptedByVideoId: new Map(),
+    pendingHandoffTimer: null,
+    activeVideoId: "",
+    activePatchVideoId: "",
+    handoffInProgress: false,
   };
 
   function log(...args) {
@@ -1495,6 +1509,120 @@ yt-source-swap-test.js text/javascript
     });
   }
 
+  function isHybridStartupMode() {
+    return !!config.hybridStartup?.enabled;
+  }
+
+  function getWatchUrlWithTimestamp(videoId, seconds) {
+    const url = new URL(location.href);
+    url.pathname = "/watch";
+    url.searchParams.set("v", videoId);
+    url.searchParams.set("t", `${Math.max(0, Math.floor(seconds))}s`);
+    return url.toString();
+  }
+
+  function hasHybridHandoffRecently(videoId) {
+    if (!videoId) return false;
+
+    const last = hybridState.handoffAttemptedByVideoId.get(videoId) || 0;
+    const age = performance.now() - last;
+
+    return age >= 0 && age < Number(config.hybridStartup.handoffCooldownMs || 30000);
+  }
+
+  function markHybridHandoffAttempted(videoId) {
+    if (!videoId) return;
+    hybridState.handoffAttemptedByVideoId.set(videoId, performance.now());
+  }
+
+  function clearHybridHandoffTimer() {
+    if (hybridState.pendingHandoffTimer) {
+      clearInterval(hybridState.pendingHandoffTimer);
+      hybridState.pendingHandoffTimer = null;
+    }
+  }
+
+  function scheduleHybridStartupHandoff(videoId) {
+    if (!isHybridStartupMode()) return;
+    if (!videoId) return;
+    if (hybridState.handoffInProgress) return;
+    if (hasHybridHandoffRecently(videoId)) return;
+
+    clearHybridHandoffTimer();
+
+    hybridState.activePatchVideoId = videoId;
+
+    remember({
+      event: "hybrid-handoff-scheduled",
+      videoId,
+      handoffAtSeconds: config.hybridStartup.handoffAtSeconds,
+      pageVideoId: getCurrentPageVideoId(),
+    });
+
+    hybridState.pendingHandoffTimer = setInterval(() => {
+      const v = document.querySelector("video");
+      const pageVideoId = getCurrentPageVideoId();
+
+      if (!v) return;
+
+      if (pageVideoId && pageVideoId !== videoId) {
+        clearHybridHandoffTimer();
+        remember({
+          event: "hybrid-handoff-cancelled",
+          reason: "video-changed",
+          scheduledVideoId: videoId,
+          pageVideoId,
+        });
+        return;
+      }
+
+      if (v.error) {
+        clearHybridHandoffTimer();
+        remember({
+          event: "hybrid-handoff-cancelled",
+          reason: "video-error-before-handoff",
+          videoId,
+          videoState: summarizeVideoElementState(),
+        });
+        return;
+      }
+
+      const currentTime = Number(v.currentTime || 0);
+      const readyState = Number(v.readyState || 0);
+      const targetSeconds = Number(config.hybridStartup.handoffAtSeconds || 5);
+
+      if (readyState < 2 || currentTime < targetSeconds) {
+        return;
+      }
+
+      clearHybridHandoffTimer();
+
+      hybridState.handoffInProgress = true;
+      markHybridHandoffAttempted(videoId);
+
+      const resumeAt = Math.max(0, currentTime - 0.25);
+      const targetUrl = getWatchUrlWithTimestamp(videoId, resumeAt);
+
+      config.enabled = false;
+
+      remember({
+        event: "hybrid-handoff-start",
+        videoId,
+        resumeAt,
+        targetUrl,
+        videoState: summarizeVideoElementState(),
+      });
+
+      setTimeout(() => {
+        try {
+          location.replace(targetUrl);
+        } catch {
+          location.href = targetUrl;
+        }
+      }, 100);
+    }, 250);
+  }
+
   function shouldAttemptSwap(meta) {
     if (!config.enabled) return [false, "disabled"];
 
@@ -1516,6 +1644,14 @@ yt-source-swap-test.js text/javascript
 
     if (endpoint === "player" && !meta.bodyJson.videoId) {
       return [false, "no-video-id"];
+    }
+
+    if (isHybridStartupMode()) {
+      const videoId = getBodyVideoId(meta.bodyJson) || getCurrentPageVideoId();
+
+      if (hasHybridHandoffRecently(videoId)) {
+        return [false, "hybrid-handoff-already-attempted"];
+      }
     }
 
     return [true, "ok"];
@@ -2015,6 +2151,14 @@ yt-source-swap-test.js text/javascript
       });
     }, 5000);
 
+    if (
+      isHybridStartupMode() &&
+      config.classicPatchMode === "mweb-progressive-auto" &&
+      targetPlayer.acceptedBy === "progressiveAutoOk"
+    ) {
+      scheduleHybridStartupHandoff(wantedVideoId || getCurrentPageVideoId());
+    }
+
     return makeJsonResponseFromOriginal(originalResp, originalJson);
   }
 
@@ -2435,6 +2579,29 @@ yt-source-swap-test.js text/javascript
     }
   };
 
+  let lastObservedVideoId = "";
+
+  setInterval(() => {
+    const current = getCurrentPageVideoId();
+
+    if (!current || current === lastObservedVideoId) return;
+
+    const previous = lastObservedVideoId;
+    lastObservedVideoId = current;
+
+    if (previous && current !== previous) {
+      clearHybridHandoffTimer();
+      hybridState.handoffInProgress = false;
+      hybridState.activeVideoId = current;
+
+      remember({
+        event: "hybrid-video-change",
+        previousVideoId: previous,
+        currentVideoId: current,
+      });
+    }
+  }, 500);
+
   g.fetch = sourceSwapFetch;
 
   g.__YT_SOURCE_SWAP_TEST__ = {
@@ -2488,6 +2655,11 @@ yt-source-swap-test.js text/javascript
         sourceMode: "",
         requestVideoId: "",
       };
+
+      clearHybridHandoffTimer();
+      hybridState.handoffInProgress = false;
+      hybridState.activeVideoId = "";
+      hybridState.activePatchVideoId = "";
     },
 
     useAutoFallback() {
@@ -2528,6 +2700,36 @@ yt-source-swap-test.js text/javascript
       config.endpoints.getWatch = true;
       config.endpoints.next = false;
       console.log("[yt-source-swap] using WEB_CREATOR full adaptive classic fallback");
+    },
+
+    useHybridStartup() {
+      config.enabled = true;
+      config.targetProfile = "mweb";
+      config.classicPatchMode = "mweb-progressive-auto";
+      config.patchPolicy = "always";
+      config.requireNonSabr = true;
+      config.hybridStartup.enabled = true;
+      config.hybridStartup.handoffAtSeconds = 5;
+      config.endpoints.player = false;
+      config.endpoints.getWatch = true;
+      config.endpoints.next = false;
+      hybridState.handoffInProgress = false;
+      clearHybridHandoffTimer();
+      console.log("[yt-source-swap] using hybrid startup: MWEB fast start then WEB handoff");
+    },
+
+    disableHybridStartup() {
+      config.hybridStartup.enabled = false;
+      hybridState.handoffInProgress = false;
+      clearHybridHandoffTimer();
+      console.log("[yt-source-swap] hybrid startup disabled");
+    },
+
+    clearHybridMemory() {
+      hybridState.handoffAttemptedByVideoId.clear();
+      hybridState.handoffInProgress = false;
+      clearHybridHandoffTimer();
+      console.log("[yt-source-swap] cleared hybrid handoff memory");
     },
 
     copyEvents() {
