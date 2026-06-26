@@ -809,6 +809,27 @@ yt-source-swap-test.js text/javascript
     return !/(?:[?&]|%26)sabr(?:=|%3D)1/i.test(String(url));
   }
 
+  function isProgressiveFormat(format) {
+    return (
+      format?.itag === 18 ||
+      format?.itag === "18" ||
+      /mp4a/i.test(String(format?.mimeType || "")) ||
+      Array.isArray(format?.audioChannels)
+    );
+  }
+
+  function hasDirectClassicUrlOrCipher(format) {
+    if (hasDirectClassicUrl(format)) return true;
+
+    const cipher = format?.signatureCipher || format?.cipher || "";
+    if (!cipher) return false;
+
+    const parsed = parseCipherString(cipher);
+    if (!parsed.url) return false;
+
+    return !/(?:[?&]|%26)sabr(?:=|%3D)1/i.test(parsed.url);
+  }
+
   function cloneProgressiveOnlyStreamingData(streamingData) {
     const clean = cloneJson(streamingData || {});
 
@@ -866,6 +887,27 @@ yt-source-swap-test.js text/javascript
     return clean;
   }
 
+  function cloneProgressiveRawCipherStreamingData(streamingData) {
+    const clean = cloneJson(streamingData || {});
+
+    delete clean.serverAbrStreamingUrl;
+    delete clean.sabrStreamingUrl;
+    delete clean.serverAbrStreamingUrlConfig;
+
+    const formats = Array.isArray(clean.formats) ? clean.formats : [];
+
+    clean.formats = formats
+      .filter(format =>
+        isProgressiveFormat(format) &&
+        hasDirectClassicUrlOrCipher(format)
+      )
+      .map(format => cloneJson(format));
+
+    clean.adaptiveFormats = [];
+
+    return clean;
+  }
+
   function makeSyntheticPlayerWithStreamingData(basePlayer, streamingData) {
     const cloned = cloneJson(basePlayer || {});
 
@@ -873,11 +915,22 @@ yt-source-swap-test.js text/javascript
       cloned.streamingData = cloneProgressiveOnlyStreamingData(streamingData);
     } else if (config.classicPatchMode === "progressive-cipher-url-only") {
       cloned.streamingData = cloneProgressiveCipherUrlOnlyStreamingData(streamingData);
+    } else if (config.classicPatchMode === "progressive-raw-cipher") {
+      cloned.streamingData = cloneProgressiveRawCipherStreamingData(streamingData);
     } else {
       cloned.streamingData = cloneClassicOnlyStreamingData(streamingData);
     }
 
     return cloned;
+  }
+
+  function hasPlayableProgressiveCandidate(streamingData) {
+    const formats = Array.isArray(streamingData?.formats) ? streamingData.formats : [];
+
+    return formats.some(format =>
+      isProgressiveFormat(format) &&
+      hasDirectClassicUrlOrCipher(format)
+    );
   }
 
   function findClassicOnlyCandidateForVideo(root, wantedVideoId = "") {
@@ -901,14 +954,21 @@ yt-source-swap-test.js text/javascript
       const synthetic = makeSyntheticPlayerWithStreamingData(match.value, streamingData);
       const summary = summarizePlayerResponse(synthetic);
 
-      if (playerSummaryIsUsable(summary)) {
+      const progressiveRawCipherOk =
+        config.classicPatchMode === "progressive-raw-cipher" &&
+        summary.status === "OK" &&
+        !summary.hasSabr &&
+        !summary.hasServerAbr &&
+        hasPlayableProgressiveCandidate(synthetic.streamingData);
+
+      if (playerSummaryIsUsable(summary) || progressiveRawCipherOk) {
         return {
           path: match.path,
           value: synthetic,
           summary,
           originalSummary: match.summary,
           streamingDetails: details,
-          mode: "classic-only-strip-serverAbr",
+          mode: config.classicPatchMode,
         };
       }
     }
