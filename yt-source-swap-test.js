@@ -274,6 +274,64 @@ yt-source-swap-test.js text/javascript
     );
   }
 
+  function schedulePostPatchPlayerPlay(videoId, reason = "post-container-patch") {
+    const delays = [250, 750, 1500];
+
+    for (const delayMs of delays) {
+      setTimeout(() => {
+        const currentVideoId = getCurrentEffectiveVideoId();
+        if (videoId && currentVideoId && currentVideoId !== videoId) return;
+
+        const player = getMoviePlayer();
+        const v = document.querySelector("video");
+
+        const playerState =
+          player && typeof player.getPlayerState === "function"
+            ? player.getPlayerState()
+            : null;
+
+        remember({
+          event: "post-patch-player-play-check",
+          reason,
+          delayMs,
+          videoId,
+          currentVideoId,
+          playerState,
+          videoState: summarizeVideoElementState(),
+        });
+
+        if (!player || typeof player.playVideo !== "function") return;
+        if (!v) return;
+        if (!v.paused) return;
+        if (v.error) return;
+
+        try {
+          player.playVideo();
+
+          remember({
+            event: "post-patch-player-play-attempt",
+            reason,
+            delayMs,
+            videoId,
+            currentVideoId,
+            playerState,
+            videoState: summarizeVideoElementState(),
+          });
+        } catch (err) {
+          remember({
+            event: "post-patch-player-play-failed",
+            reason,
+            delayMs,
+            videoId,
+            currentVideoId,
+            error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
+            videoState: summarizeVideoElementState(),
+          });
+        }
+      }, delayMs);
+    }
+  }
+
   function playerEndpointUrl() {
     return `${location.origin}/youtubei/v1/player?prettyPrint=false`;
   }
@@ -2746,6 +2804,8 @@ yt-source-swap-test.js text/javascript
       playableProgressiveCandidate: hasPlayableProgressiveCandidate(targetPlayer.value.streamingData),
       acceptedBy: targetPlayer.acceptedBy || "",
     });
+
+    schedulePostPatchPlayerPlay(wantedVideoId || getCurrentEffectiveVideoId());
 
     lastPatch = {
       time: performance.now(),
