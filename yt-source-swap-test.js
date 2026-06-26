@@ -180,6 +180,18 @@ yt-source-swap-test.js text/javascript
     );
   }
 
+  function getCurrentUrlVideoId() {
+    try {
+      return new URL(location.href).searchParams.get("v") || "";
+    } catch {
+      return "";
+    }
+  }
+
+  function getCurrentEffectiveVideoId() {
+    return getCurrentUrlVideoId() || getCurrentPageVideoId() || "";
+  }
+
   function getBodyVideoId(bodyJson) {
     return (
       bodyJson?.videoId ||
@@ -1620,21 +1632,27 @@ yt-source-swap-test.js text/javascript
       videoId,
       handoffAtSeconds: config.hybridStartup.handoffAtSeconds,
       pageVideoId: getCurrentPageVideoId(),
+      urlVideoId: getCurrentUrlVideoId(),
+      effectiveVideoId: getCurrentEffectiveVideoId(),
     });
 
     hybridState.pendingHandoffTimer = setInterval(() => {
       const v = document.querySelector("video");
       const pageVideoId = getCurrentPageVideoId();
+      const urlVideoId = getCurrentUrlVideoId();
+      const effectiveVideoId = getCurrentEffectiveVideoId();
 
       if (!v) return;
 
-      if (pageVideoId && pageVideoId !== videoId) {
+      if (effectiveVideoId && effectiveVideoId !== videoId) {
         clearHybridHandoffTimer();
         remember({
           event: "hybrid-handoff-cancelled",
           reason: "video-changed",
           scheduledVideoId: videoId,
           pageVideoId,
+          urlVideoId,
+          effectiveVideoId,
         });
         return;
       }
@@ -2654,7 +2672,7 @@ yt-source-swap-test.js text/javascript
   let lastObservedVideoId = "";
 
   setInterval(() => {
-    const current = getCurrentPageVideoId();
+    const current = getCurrentEffectiveVideoId();
 
     if (!current || current === lastObservedVideoId) return;
 
@@ -2670,6 +2688,8 @@ yt-source-swap-test.js text/javascript
         event: "hybrid-video-change",
         previousVideoId: previous,
         currentVideoId: current,
+        pageVideoId: getCurrentPageVideoId(),
+        urlVideoId: getCurrentUrlVideoId(),
       });
     }
   }, 500);
@@ -2807,16 +2827,20 @@ yt-source-swap-test.js text/javascript
 
     hybridStatus() {
       const pageVideoId = getCurrentPageVideoId();
+      const urlVideoId = getCurrentUrlVideoId();
+      const effectiveVideoId = getCurrentEffectiveVideoId();
       const persisted = readPersistedHybridHandoff();
 
       return {
         pageVideoId,
+        urlVideoId,
+        effectiveVideoId,
         config: cloneJson(config.hybridStartup),
         handoffInProgress: hybridState.handoffInProgress,
         activeVideoId: hybridState.activeVideoId,
         activePatchVideoId: hybridState.activePatchVideoId,
         persisted,
-        persistedApplies: !!getActivePersistedHybridBypass(pageVideoId),
+        persistedApplies: !!getActivePersistedHybridBypass(effectiveVideoId),
       };
     },
 
