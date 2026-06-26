@@ -70,6 +70,7 @@ yt-source-swap-test.js text/javascript
     interceptFetch: true,
     interceptXhr: true,
     allowClassicOnlyFromSabrTargets: true,
+    classicPatchMode: "progressive-only",
     endpoints: {
       player: false,
       getWatch: true,
@@ -186,6 +187,32 @@ yt-source-swap-test.js text/javascript
         urlStart: String(url).slice(0, 260),
       };
     }
+  }
+
+  function summarizeVideoElementState() {
+    const v = document.querySelector("video");
+
+    if (!v) {
+      return {
+        hasVideo: false,
+      };
+    }
+
+    return {
+      hasVideo: true,
+      currentSrc: v.currentSrc || "",
+      readyState: v.readyState,
+      networkState: v.networkState,
+      paused: v.paused,
+      currentTime: v.currentTime,
+      duration: v.duration,
+      error: v.error
+        ? {
+            code: v.error.code,
+            message: v.error.message,
+          }
+        : null,
+    };
   }
 
   function playerEndpointUrl() {
@@ -699,9 +726,36 @@ yt-source-swap-test.js text/javascript
     return clean;
   }
 
+  function hasDirectClassicUrl(format) {
+    const url = format?.url || "";
+    if (!url) return false;
+    return !/(?:[?&]|%26)sabr(?:=|%3D)1/i.test(String(url));
+  }
+
+  function cloneProgressiveOnlyStreamingData(streamingData) {
+    const clean = cloneJson(streamingData || {});
+
+    delete clean.serverAbrStreamingUrl;
+    delete clean.sabrStreamingUrl;
+    delete clean.serverAbrStreamingUrlConfig;
+
+    const formats = Array.isArray(clean.formats) ? clean.formats : [];
+    clean.formats = formats.filter(hasDirectClassicUrl);
+
+    clean.adaptiveFormats = [];
+
+    return clean;
+  }
+
   function makeSyntheticPlayerWithStreamingData(basePlayer, streamingData) {
     const cloned = cloneJson(basePlayer || {});
-    cloned.streamingData = cloneClassicOnlyStreamingData(streamingData);
+
+    if (config.classicPatchMode === "progressive-only") {
+      cloned.streamingData = cloneProgressiveOnlyStreamingData(streamingData);
+    } else {
+      cloned.streamingData = cloneClassicOnlyStreamingData(streamingData);
+    }
+
     return cloned;
   }
 
@@ -941,6 +995,7 @@ yt-source-swap-test.js text/javascript
       targetClientHeaderName: getTargetProfile().clientHeaderName,
       bodyType: meta.bodyType,
       bodyTextLength: meta.bodyTextLength,
+      classicPatchMode: config.classicPatchMode,
       topKeys: meta.bodyJson ? Object.keys(meta.bodyJson).slice(0, 40) : [],
     });
 
@@ -1092,6 +1147,7 @@ yt-source-swap-test.js text/javascript
         targetBestPath: targetPlayer?.path || "",
         modernPath: modernPlayer?.path || "",
         targetSelectionMode,
+        classicPatchMode: config.classicPatchMode,
       });
 
       return originalResp;
@@ -1143,6 +1199,7 @@ yt-source-swap-test.js text/javascript
         adStateAfterStrip,
         patchedSummary,
         targetSelectionMode,
+        classicPatchMode: config.classicPatchMode,
       });
 
       return originalResp;
@@ -1177,6 +1234,7 @@ yt-source-swap-test.js text/javascript
       patchedSummary,
       adStateBeforeStrip,
       adStateAfterStrip,
+      classicPatchMode: config.classicPatchMode,
     });
 
     lastPatch = {
@@ -1185,6 +1243,24 @@ yt-source-swap-test.js text/javascript
       sourceMode: targetResult.sourceMode,
       requestVideoId: wantedVideoId,
     };
+
+    setTimeout(() => {
+      remember({
+        event: "video-state-after-patch",
+        delayMs: 1000,
+        recentPatch: lastPatch,
+        videoState: summarizeVideoElementState(),
+      });
+    }, 1000);
+
+    setTimeout(() => {
+      remember({
+        event: "video-state-after-patch",
+        delayMs: 5000,
+        recentPatch: lastPatch,
+        videoState: summarizeVideoElementState(),
+      });
+    }, 5000);
 
     return makeJsonResponseFromOriginal(originalResp, originalJson);
   }
@@ -1322,6 +1398,7 @@ yt-source-swap-test.js text/javascript
             status: resp.status,
             statusText: resp.statusText,
             activeTargetProfile: getTargetProfile().key,
+            classicPatchMode: config.classicPatchMode,
             maybeFromPatch,
             recentPatchAgeMs: Math.round(recentPatchAgeMs),
             recentPatch: maybeFromPatch ? lastPatch : null,
@@ -1332,6 +1409,7 @@ yt-source-swap-test.js text/javascript
             event: "media-ok",
             status: resp.status,
             activeTargetProfile: getTargetProfile().key,
+            classicPatchMode: config.classicPatchMode,
             maybeFromPatch,
             recentPatchAgeMs: Math.round(recentPatchAgeMs),
             recentPatch: maybeFromPatch ? lastPatch : null,
@@ -1638,6 +1716,12 @@ yt-source-swap-test.js text/javascript
     copyEvents() {
       copy(JSON.stringify(events, null, 2));
       console.log(`[yt-source-swap] copied ${events.length} event(s)`);
+    },
+
+    videoState() {
+      const state = summarizeVideoElementState();
+      console.log("[yt-source-swap] videoState", state);
+      return state;
     },
 
     copyStats() {
