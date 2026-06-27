@@ -88,12 +88,40 @@ yt-source-swap-test.js text/javascript
       autoHandoff: true,
       warmupMaxWaitMs: 12000,
     },
+    hiddenWarmup: {
+      enabled: true,
+      transition: true,
+      pollIntervalMs: 250,
+      warmupTimeoutMs: 25000,
+      readyState: 3,
+      maxDriftSeconds: 1.25,
+      syncDriftSeconds: 0.6,
+      opacityTransitionMs: 120,
+      quality: "hd720",
+      keepOverlayAfterTransition: true,
+    },
     endpoints: {
       player: false,
       getWatch: true,
       next: false,
     },
   };
+
+  const isHiddenWarmFrame = (() => {
+    try {
+      return new URL(location.href).searchParams.get("yt_source_swap_hidden_warm") === "1";
+    } catch {
+      return false;
+    }
+  })();
+
+  if (isHiddenWarmFrame) {
+    config.hybridStartup.enabled = false;
+    config.hiddenWarmup.enabled = false;
+    config.endpoints.getWatch = false;
+    config.endpoints.player = false;
+    config.endpoints.next = false;
+  }
 
   const counters = {
     seen: 0,
@@ -151,6 +179,20 @@ yt-source-swap-test.js text/javascript
   };
 
   const HYBRID_SESSION_KEY = "__yt_source_swap_hybrid_handoff__";
+  const HIDDEN_WARM_REPLAY_SESSION_KEY = "__yt_source_swap_hidden_warm_replay__";
+
+  const hiddenWarmState = {
+    container: null,
+    frame: null,
+    timer: null,
+    videoId: "",
+    startedAt: 0,
+    ready: false,
+    transitioned: false,
+    lastReason: "",
+    lastProbe: null,
+    warmupSource: null,
+  };
 
   function log(...args) {
     if (config.logVerbose) {
@@ -197,7 +239,10 @@ yt-source-swap-test.js text/javascript
 
   function getCurrentUrlVideoId() {
     try {
-      return new URL(location.href).searchParams.get("v") || "";
+      const url = new URL(location.href);
+      const embedMatch = url.pathname.match(/^\/embed\/([^/?#]+)/);
+      if (embedMatch) return decodeURIComponent(embedMatch[1] || "");
+      return url.searchParams.get("v") || "";
     } catch {
       return "";
     }
@@ -1345,6 +1390,146 @@ yt-source-swap-test.js text/javascript
     return persisted;
   }
 
+  function stripAdStateDeep(json) {
+    const cloned = cloneJson(json || {});
+
+    try {
+      stripPlayerAdState(cloned);
+
+      for (const playerLike of findPlayerLikeObjects(cloned)) {
+        if (playerLike?.value) {
+          stripPlayerAdState(playerLike.value);
+        }
+      }
+    } catch {}
+
+    return cloned;
+  }
+
+  function writeHiddenWarmReplay(videoId, warmup) {
+    if (!videoId || !warmup?.ok) return null;
+
+    const playerWarmup = (warmup.results || []).find(r =>
+      r?.ok && r?.json && (r.sourceMode || "").includes("player")
+    );
+
+    const nextWarmup = (warmup.results || []).find(r =>
+      r?.ok && r?.json && (r.sourceMode || "").includes("next")
+    );
+
+    if (!playerWarmup?.json) {
+      return null;
+    }
+
+    const now = Date.now();
+    const ttlMs = Math.max(15000, Number(config.hiddenWarmup?.warmupTimeoutMs || 25000) + 15000);
+
+    const payload = {
+      videoId,
+      createdAt: now,
+      expiresAt: now + ttlMs,
+      playerJson: stripAdStateDeep(playerWarmup.json),
+      nextJson: nextWarmup?.json ? stripAdStateDeep(nextWarmup.json) : null,
+      playerSourceMode: playerWarmup.sourceMode || "",
+      nextSourceMode: nextWarmup?.sourceMode || "",
+    };
+
+    try {
+      sessionStorage.setItem(HIDDEN_WARM_REPLAY_SESSION_KEY, JSON.stringify(payload));
+    } catch (err) {
+      remember({
+        event: "hidden-warm-replay-write-failed",
+        videoId,
+        error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
+      });
+
+      return null;
+    }
+
+    remember({
+      event: "hidden-warm-replay-written",
+      videoId,
+      expiresInMs: ttlMs,
+      hasPlayerJson: !!payload.playerJson,
+      hasNextJson: !!payload.nextJson,
+      playerSourceMode: payload.playerSourceMode,
+      nextSourceMode: payload.nextSourceMode,
+    });
+
+    return payload;
+  }
+
+  function readHiddenWarmReplay() {
+    try {
+      const raw = sessionStorage.getItem(HIDDEN_WARM_REPLAY_SESSION_KEY);
+      if (!raw) return null;
+
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object") return null;
+
+      return parsed;
+    } catch {
+      return null;
+    }
+  }
+
+  function clearHiddenWarmReplay() {
+    try {
+      sessionStorage.removeItem(HIDDEN_WARM_REPLAY_SESSION_KEY);
+    } catch {}
+  }
+
+  function getActiveHiddenWarmReplay(videoId) {
+    const replay = readHiddenWarmReplay();
+
+    if (!replay?.videoId) return null;
+
+    if (Date.now() > Number(replay.expiresAt || 0)) {
+      clearHiddenWarmReplay();
+      return null;
+    }
+
+    if (videoId && replay.videoId !== videoId) {
+      return null;
+    }
+
+    return replay;
+  }
+
+  function getHiddenWarmReplayJsonForMeta(meta) {
+    if (!isHiddenWarmFrame) return null;
+
+    const endpoint = meta.endpoint || endpointForUrl(meta.url);
+    if (endpoint !== "player" && endpoint !== "next") return null;
+
+    const requestVideoId =
+      getBodyVideoId(meta.bodyJson) ||
+      getCurrentEffectiveVideoId();
+
+    const replay = getActiveHiddenWarmReplay(requestVideoId);
+    if (!replay) return null;
+
+    if (endpoint === "player" && replay.playerJson) {
+      return {
+        endpoint,
+        videoId: replay.videoId,
+        json: replay.playerJson,
+        sourceMode: replay.playerSourceMode || "",
+      };
+    }
+
+    if (endpoint === "next" && replay.nextJson) {
+      return {
+        endpoint,
+        videoId: replay.videoId,
+        json: replay.nextJson,
+        sourceMode: replay.nextSourceMode || "",
+      };
+    }
+
+    return null;
+  }
+
   function getWatchUrlWithTimestamp(videoId, seconds) {
     const url = new URL(location.href);
     url.pathname = "/watch";
@@ -1482,6 +1667,489 @@ yt-source-swap-test.js text/javascript
 
   function delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  function getVisibleVideo() {
+    return document.querySelector("video");
+  }
+
+  function getVisiblePlayerBounds() {
+    const el =
+      document.querySelector("#movie_player") ||
+      document.querySelector("ytd-player") ||
+      getVisibleVideo();
+
+    if (!el || typeof el.getBoundingClientRect !== "function") {
+      return null;
+    }
+
+    const rect = el.getBoundingClientRect();
+
+    if (!rect.width || !rect.height) {
+      return null;
+    }
+
+    return rect;
+  }
+
+  function alignHiddenWarmupOverlay() {
+    if (!hiddenWarmState.container) return;
+
+    const rect = getVisiblePlayerBounds();
+
+    if (!rect) {
+      hiddenWarmState.container.style.inset = "0";
+      return;
+    }
+
+    hiddenWarmState.container.style.left = `${Math.round(rect.left)}px`;
+    hiddenWarmState.container.style.top = `${Math.round(rect.top)}px`;
+    hiddenWarmState.container.style.width = `${Math.round(rect.width)}px`;
+    hiddenWarmState.container.style.height = `${Math.round(rect.height)}px`;
+  }
+
+  function getHiddenWarmDocument() {
+    try {
+      return hiddenWarmState.frame?.contentDocument ||
+        hiddenWarmState.frame?.contentWindow?.document ||
+        null;
+    } catch {
+      return null;
+    }
+  }
+
+  function getHiddenWarmVideo() {
+    try {
+      return getHiddenWarmDocument()?.querySelector("video") || null;
+    } catch {
+      return null;
+    }
+  }
+
+  function getHiddenWarmMoviePlayer() {
+    try {
+      const doc = getHiddenWarmDocument();
+      return doc?.getElementById("movie_player") ||
+        doc?.querySelector("#movie_player") ||
+        null;
+    } catch {
+      return null;
+    }
+  }
+
+  function postHiddenWarmPlayerCommand(func, args = []) {
+    try {
+      hiddenWarmState.frame?.contentWindow?.postMessage(JSON.stringify({
+        event: "command",
+        func,
+        args,
+      }), location.origin);
+    } catch {}
+  }
+
+  function summarizeHiddenWarmVideoState() {
+    const v = getHiddenWarmVideo();
+    if (!v) {
+      return {
+        hasVideo: false,
+      };
+    }
+
+    return {
+      hasVideo: true,
+      currentSrc: v.currentSrc || "",
+      isBlob: String(v.currentSrc || "").startsWith("blob:"),
+      readyState: v.readyState,
+      networkState: v.networkState,
+      paused: v.paused,
+      muted: v.muted,
+      volume: v.volume,
+      currentTime: v.currentTime,
+      duration: v.duration,
+      error: v.error
+        ? {
+            code: v.error.code,
+            message: v.error.message,
+          }
+        : null,
+    };
+  }
+
+  function clearHiddenWarmupState(reason = "clear") {
+    if (hiddenWarmState.timer) {
+      clearInterval(hiddenWarmState.timer);
+      hiddenWarmState.timer = null;
+    }
+
+    if (hiddenWarmState.container?.parentNode) {
+      hiddenWarmState.container.parentNode.removeChild(hiddenWarmState.container);
+    }
+
+    if (hiddenWarmState.videoId || hiddenWarmState.container || hiddenWarmState.frame) {
+      remember({
+        event: "hidden-warmup-cleared",
+        reason,
+        videoId: hiddenWarmState.videoId,
+        ready: hiddenWarmState.ready,
+        transitioned: hiddenWarmState.transitioned,
+        lastReason: hiddenWarmState.lastReason,
+        lastProbe: hiddenWarmState.lastProbe,
+      });
+    }
+
+    hiddenWarmState.container = null;
+    hiddenWarmState.frame = null;
+    hiddenWarmState.videoId = "";
+    hiddenWarmState.startedAt = 0;
+    hiddenWarmState.ready = false;
+    hiddenWarmState.transitioned = false;
+    hiddenWarmState.lastReason = "";
+    hiddenWarmState.lastProbe = null;
+    hiddenWarmState.warmupSource = null;
+  }
+
+  function buildHiddenWarmupEmbedUrl(videoId, startSeconds) {
+    const url = new URL(`${location.origin}/embed/${encodeURIComponent(videoId)}`);
+
+    url.searchParams.set("enablejsapi", "1");
+    url.searchParams.set("origin", location.origin);
+    url.searchParams.set("autoplay", "1");
+    url.searchParams.set("mute", "1");
+    url.searchParams.set("playsinline", "1");
+    url.searchParams.set("controls", "1");
+    url.searchParams.set("rel", "0");
+    url.searchParams.set("start", `${Math.max(0, Math.floor(Number(startSeconds || 0)))}`);
+    url.searchParams.set("yt_source_swap_hidden_warm", "1");
+
+    return url.toString();
+  }
+
+  function createHiddenWarmupOverlay(videoId, startSeconds) {
+    const container = document.createElement("div");
+    const frame = document.createElement("iframe");
+
+    container.setAttribute("data-yt-source-swap-hidden-warmup", "1");
+    container.style.position = "fixed";
+    container.style.zIndex = "2147483646";
+    container.style.opacity = "0";
+    container.style.pointerEvents = "none";
+    container.style.overflow = "hidden";
+    container.style.background = "#000";
+    container.style.transition = `opacity ${Number(config.hiddenWarmup.opacityTransitionMs || 120)}ms linear`;
+
+    frame.src = buildHiddenWarmupEmbedUrl(videoId, startSeconds);
+    frame.allow = "autoplay; encrypted-media; picture-in-picture; fullscreen";
+    frame.referrerPolicy = "strict-origin-when-cross-origin";
+    frame.style.width = "100%";
+    frame.style.height = "100%";
+    frame.style.border = "0";
+    frame.style.display = "block";
+
+    container.appendChild(frame);
+    document.documentElement.appendChild(container);
+
+    hiddenWarmState.container = container;
+    hiddenWarmState.frame = frame;
+
+    alignHiddenWarmupOverlay();
+  }
+
+  function syncHiddenWarmupToVisible(reason = "poll-sync") {
+    const visible = getVisibleVideo();
+    const hidden = getHiddenWarmVideo();
+    const hiddenPlayer = getHiddenWarmMoviePlayer();
+
+    if (!visible || !hidden) return null;
+
+    const visibleTime = Number(visible.currentTime || 0);
+    const hiddenTime = Number(hidden.currentTime || 0);
+    const drift = hiddenTime - visibleTime;
+    const syncDrift = Number(config.hiddenWarmup.syncDriftSeconds || 0.6);
+
+    if (Number.isFinite(drift) && Math.abs(drift) > syncDrift && hidden.readyState >= 1) {
+      try {
+        if (hiddenPlayer && typeof hiddenPlayer.seekTo === "function") {
+          hiddenPlayer.seekTo(Math.max(0, visibleTime), true);
+        } else {
+          hidden.currentTime = Math.max(0, visibleTime);
+          postHiddenWarmPlayerCommand("seekTo", [Math.max(0, visibleTime), true]);
+        }
+
+        remember({
+          event: "hidden-warmup-sync",
+          reason,
+          videoId: hiddenWarmState.videoId,
+          visibleTime,
+          hiddenTime,
+          drift,
+        });
+      } catch (err) {
+        remember({
+          event: "hidden-warmup-sync-failed",
+          reason,
+          videoId: hiddenWarmState.videoId,
+          visibleTime,
+          hiddenTime,
+          drift,
+          error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
+        });
+      }
+    }
+
+    return {
+      visibleTime,
+      hiddenTime,
+      drift,
+    };
+  }
+
+  function driveHiddenWarmupPlayback(reason = "poll") {
+    const hidden = getHiddenWarmVideo();
+    const hiddenPlayer = getHiddenWarmMoviePlayer();
+
+    try {
+      if (hidden) {
+        hidden.muted = true;
+        hidden.playsInline = true;
+
+        if (hidden.paused && typeof hidden.play === "function") {
+          Promise.resolve(hidden.play()).catch(err => {
+            remember({
+              event: "hidden-warmup-play-promise-rejected",
+              reason,
+              videoId: hiddenWarmState.videoId,
+              error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
+            });
+          });
+        }
+      }
+
+      if (hiddenPlayer) {
+        if (typeof hiddenPlayer.mute === "function") hiddenPlayer.mute();
+        if (typeof hiddenPlayer.playVideo === "function") hiddenPlayer.playVideo();
+        if (typeof hiddenPlayer.setPlaybackQuality === "function") {
+          hiddenPlayer.setPlaybackQuality(config.hiddenWarmup.quality || "hd720");
+        }
+      } else {
+        postHiddenWarmPlayerCommand("mute");
+        postHiddenWarmPlayerCommand("playVideo");
+        postHiddenWarmPlayerCommand("setPlaybackQuality", [config.hiddenWarmup.quality || "hd720"]);
+      }
+    } catch (err) {
+      remember({
+        event: "hidden-warmup-drive-failed",
+        reason,
+        videoId: hiddenWarmState.videoId,
+        error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
+      });
+    }
+  }
+
+  function transitionToHiddenWarmup(reason = "ready") {
+    if (!config.hiddenWarmup.transition) return false;
+    if (hiddenWarmState.transitioned) return true;
+
+    const visible = getVisibleVideo();
+    const visiblePlayer = getMoviePlayer();
+    const hidden = getHiddenWarmVideo();
+    const hiddenPlayer = getHiddenWarmMoviePlayer();
+    const sync = syncHiddenWarmupToVisible("transition");
+
+    alignHiddenWarmupOverlay();
+    driveHiddenWarmupPlayback("transition");
+
+    try {
+      if (hidden) {
+        hidden.muted = false;
+        hidden.volume = visible ? visible.volume : 1;
+      }
+
+      if (hiddenPlayer) {
+        if (typeof hiddenPlayer.unMute === "function") hiddenPlayer.unMute();
+        if (typeof hiddenPlayer.setVolume === "function") {
+          hiddenPlayer.setVolume(Math.round(((visible?.volume ?? 1) || 1) * 100));
+        }
+        if (typeof hiddenPlayer.playVideo === "function") hiddenPlayer.playVideo();
+      } else {
+        postHiddenWarmPlayerCommand("unMute");
+        postHiddenWarmPlayerCommand("setVolume", [Math.round(((visible?.volume ?? 1) || 1) * 100)]);
+        postHiddenWarmPlayerCommand("playVideo");
+      }
+    } catch (err) {
+      remember({
+        event: "hidden-warmup-unmute-failed",
+        reason,
+        videoId: hiddenWarmState.videoId,
+        error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
+      });
+    }
+
+    if (hiddenWarmState.container) {
+      hiddenWarmState.container.style.pointerEvents = "auto";
+      hiddenWarmState.container.style.opacity = "1";
+    }
+
+    setTimeout(() => {
+      try {
+        if (visiblePlayer && typeof visiblePlayer.pauseVideo === "function") {
+          visiblePlayer.pauseVideo();
+        } else if (visible) {
+          visible.pause();
+        }
+      } catch {}
+    }, Math.max(40, Number(config.hiddenWarmup.opacityTransitionMs || 120)));
+
+    hiddenWarmState.transitioned = true;
+    hiddenWarmState.ready = true;
+
+    remember({
+      event: "hidden-warmup-transition",
+      reason,
+      videoId: hiddenWarmState.videoId,
+      sync,
+      visibleState: summarizeVideoElementState(),
+      hiddenState: summarizeHiddenWarmVideoState(),
+    });
+
+    return true;
+  }
+
+  function pollHiddenWarmup() {
+    const videoId = hiddenWarmState.videoId;
+    if (!videoId) return;
+
+    const effectiveId = getCurrentEffectiveVideoId();
+    if (effectiveId && effectiveId !== videoId) {
+      clearHiddenWarmupState("video-changed");
+      return;
+    }
+
+    alignHiddenWarmupOverlay();
+    driveHiddenWarmupPlayback("poll");
+    const sync = syncHiddenWarmupToVisible("poll");
+
+    const hiddenState = summarizeHiddenWarmVideoState();
+    const ageMs = Math.round(performance.now() - hiddenWarmState.startedAt);
+    const requiredReadyState = Number(config.hiddenWarmup.readyState || 3);
+    const maxDrift = Number(config.hiddenWarmup.maxDriftSeconds || 1.25);
+    const driftOk =
+      !sync ||
+      !Number.isFinite(sync.drift) ||
+      Math.abs(sync.drift) <= maxDrift ||
+      hiddenState.readyState >= 4;
+
+    const ready =
+      hiddenState.hasVideo &&
+      hiddenState.isBlob &&
+      !hiddenState.error &&
+      Number(hiddenState.readyState || 0) >= requiredReadyState &&
+      driftOk;
+
+    hiddenWarmState.lastProbe = {
+      ageMs,
+      ready,
+      driftOk,
+      sync,
+      hiddenState,
+    };
+
+    if (!hiddenWarmState.ready && ready) {
+      hiddenWarmState.ready = true;
+      hiddenWarmState.lastReason = "blob-ready";
+
+      remember({
+        event: "hidden-warmup-ready",
+        videoId,
+        ageMs,
+        requiredReadyState,
+        maxDrift,
+        sync,
+        hiddenState,
+      });
+
+      transitionToHiddenWarmup("blob-ready");
+      return;
+    }
+
+    if (ageMs > Number(config.hiddenWarmup.warmupTimeoutMs || 25000)) {
+      hiddenWarmState.lastReason = "timeout";
+
+      remember({
+        event: "hidden-warmup-timeout",
+        videoId,
+        ageMs,
+        sync,
+        hiddenState,
+        visibleState: summarizeVideoElementState(),
+      });
+
+      clearHiddenWarmupState("timeout");
+    }
+  }
+
+  function startHiddenWarmupFromWarmup(videoId, warmup, reason = "warmup-ready") {
+    if (!config.hiddenWarmup?.enabled) return false;
+    if (isHiddenWarmFrame) return false;
+    if (!videoId) return false;
+
+    const currentEffectiveId = getCurrentEffectiveVideoId();
+    if (currentEffectiveId && currentEffectiveId !== videoId) {
+      remember({
+        event: "hidden-warmup-not-started",
+        reason: "video-changed",
+        videoId,
+        currentEffectiveId,
+      });
+
+      return false;
+    }
+
+    const replay = writeHiddenWarmReplay(videoId, warmup);
+    if (!replay) {
+      remember({
+        event: "hidden-warmup-not-started",
+        reason: "no-hidden-replay-payload",
+        videoId,
+        warmupResults: warmup?.results || [],
+      });
+
+      return false;
+    }
+
+    clearHiddenWarmupState("restart");
+
+    const visible = getVisibleVideo();
+    const startSeconds = Number(visible?.currentTime || handoffState.replay.resumeAt || 0);
+
+    hiddenWarmState.videoId = videoId;
+    hiddenWarmState.startedAt = performance.now();
+    hiddenWarmState.ready = false;
+    hiddenWarmState.transitioned = false;
+    hiddenWarmState.lastReason = "warming";
+    hiddenWarmState.warmupSource = {
+      reason,
+      playerSourceMode: replay.playerSourceMode || "",
+      nextSourceMode: replay.nextSourceMode || "",
+    };
+
+    createHiddenWarmupOverlay(videoId, startSeconds);
+
+    hiddenWarmState.timer = setInterval(
+      pollHiddenWarmup,
+      Math.max(100, Number(config.hiddenWarmup.pollIntervalMs || 250))
+    );
+
+    remember({
+      event: "hidden-warmup-start",
+      reason,
+      videoId,
+      startSeconds,
+      src: hiddenWarmState.frame?.src || "",
+      warmupSource: hiddenWarmState.warmupSource,
+      visibleState: summarizeVideoElementState(),
+    });
+
+    return true;
   }
 
   function stabilizeAggressiveBlobPlayback(videoId, resumeAt, reason = "aggressive-post-blob") {
@@ -1917,6 +2585,26 @@ yt-source-swap-test.js text/javascript
         warmupResults: warmup.results,
         videoState: summarizeVideoElementState(),
       });
+
+      if (config.hiddenWarmup?.enabled) {
+        const startedHiddenWarmup = startHiddenWarmupFromWarmup(videoId, warmup, "web-warmup-ready");
+
+        remember({
+          event: startedHiddenWarmup
+            ? "source-swap-hidden-warmup-started"
+            : "source-swap-hidden-warmup-not-started",
+          reason: startedHiddenWarmup
+            ? "hidden-warmup"
+            : hiddenWarmState.lastReason || "hidden-warmup-start-failed",
+          videoId,
+          warmupResults: warmup.results,
+          videoState: summarizeVideoElementState(),
+        });
+
+        if (startedHiddenWarmup) {
+          return;
+        }
+      }
 
       const swapResult = await attemptAggressiveWarmReplayHandoff(videoId, warmup);
 
@@ -2734,6 +3422,26 @@ yt-source-swap-test.js text/javascript
 
       meta = await readFetchMeta(input, init);
 
+      const hiddenReplay = getHiddenWarmReplayJsonForMeta(meta);
+      if (hiddenReplay) {
+        remember({
+          event: "hidden-warm-replay-hit",
+          endpoint: hiddenReplay.endpoint,
+          transport: meta.transport,
+          videoId: hiddenReplay.videoId,
+          sourceMode: hiddenReplay.sourceMode,
+        });
+
+        return new Response(JSON.stringify(hiddenReplay.json), {
+          status: 200,
+          statusText: "OK",
+          headers: {
+            "content-type": "application/json; charset=utf-8",
+            "x-yt-source-swap-hidden-warm-replay": hiddenReplay.endpoint,
+          },
+        });
+      }
+
       if (checkAndDisarmReplay()) {
         const endpoint = meta.endpoint || endpointForUrl(meta.url);
         const requestVideoId =
@@ -2981,6 +3689,24 @@ yt-source-swap-test.js text/javascript
         counters.lastTransport = "xhr";
         counters.lastEndpoint = meta.endpoint || "";
 
+        const hiddenReplay = getHiddenWarmReplayJsonForMeta(meta);
+        if (hiddenReplay) {
+          remember({
+            event: "hidden-warm-replay-hit",
+            endpoint: hiddenReplay.endpoint,
+            transport: meta.transport,
+            videoId: hiddenReplay.videoId,
+            sourceMode: hiddenReplay.sourceMode,
+          });
+
+          finishSyntheticXhr(xhr, {
+            json: hiddenReplay.json,
+            responseText: JSON.stringify(hiddenReplay.json),
+          }, meta.url);
+
+          return;
+        }
+
         if (checkAndDisarmReplay()) {
           const endpoint = meta.endpoint || endpointForUrl(meta.url);
           const requestVideoId =
@@ -3116,6 +3842,7 @@ yt-source-swap-test.js text/javascript
 
     if (previous && current !== previous) {
       clearHandoffTimer();
+      clearHiddenWarmupState("video-changed");
       handoffState.inProgress = false;
       handoffState.activeVideoId = current;
 
@@ -3163,6 +3890,8 @@ yt-source-swap-test.js text/javascript
       };
 
       clearHandoffTimer();
+      clearHiddenWarmupState("clear");
+      clearHiddenWarmReplay();
       handoffState.inProgress = false;
       handoffState.activeVideoId = "";
       handoffState.activePatchVideoId = "";
@@ -3177,6 +3906,8 @@ yt-source-swap-test.js text/javascript
       handoffState.inProgress = false;
       clearHandoffTimer();
       clearPersistedHybridHandoff();
+      clearHiddenWarmupState("clear-hybrid-memory");
+      clearHiddenWarmReplay();
       handoffState.warmupByVideoId.clear();
       console.log("[yt-source-swap] cleared hybrid handoff memory");
     },
@@ -3200,6 +3931,54 @@ yt-source-swap-test.js text/javascript
       };
     },
 
+    hiddenStatus() {
+      const state = {
+        config: cloneJson(config.hiddenWarmup),
+        isHiddenWarmFrame,
+        replay: (() => {
+          const replay = readHiddenWarmReplay();
+          if (!replay) return null;
+          return {
+            videoId: replay.videoId,
+            createdAt: replay.createdAt,
+            expiresAt: replay.expiresAt,
+            hasPlayerJson: !!replay.playerJson,
+            hasNextJson: !!replay.nextJson,
+            playerSourceMode: replay.playerSourceMode || "",
+            nextSourceMode: replay.nextSourceMode || "",
+          };
+        })(),
+        state: {
+          videoId: hiddenWarmState.videoId,
+          startedAt: hiddenWarmState.startedAt,
+          ready: hiddenWarmState.ready,
+          transitioned: hiddenWarmState.transitioned,
+          lastReason: hiddenWarmState.lastReason,
+          warmupSource: hiddenWarmState.warmupSource,
+          lastProbe: hiddenWarmState.lastProbe,
+        },
+        visibleState: summarizeVideoElementState(),
+        hiddenState: summarizeHiddenWarmVideoState(),
+      };
+
+      console.log("[yt-source-swap] hiddenStatus", state);
+      return state;
+    },
+
+    startHiddenWarmup() {
+      const videoId = getCurrentEffectiveVideoId();
+      const warmup = handoffState.warmupByVideoId.get(videoId);
+      const ok = startHiddenWarmupFromWarmup(videoId, warmup, "manual-console");
+      console.log("[yt-source-swap] startHiddenWarmup", { ok, videoId, warmup });
+      return ok;
+    },
+
+    clearHiddenWarmup() {
+      clearHiddenWarmupState("manual-console");
+      clearHiddenWarmReplay();
+      console.log("[yt-source-swap] cleared hidden warmup");
+    },
+
     copyEvents() {
       copy(JSON.stringify(events, null, 2));
       console.log(`[yt-source-swap] copied ${events.length} event(s)`);
@@ -3217,6 +3996,8 @@ yt-source-swap-test.js text/javascript
     },
 
     stop() {
+      clearHandoffTimer();
+      clearHiddenWarmupState("stop");
       g.fetch = nativeFetch;
       XMLHttpRequest.prototype.open = nativeOpen;
       XMLHttpRequest.prototype.send = nativeSend;
