@@ -1470,6 +1470,165 @@ yt-source-swap-test.js text/javascript
     return record;
   }
 
+  function attemptDirectWarmSourceSwap(videoId, warmup) {
+    const effectiveId = getCurrentEffectiveVideoId();
+    if (effectiveId && effectiveId !== videoId) {
+      return { attempted: false, reason: "video-changed" };
+    }
+
+    const v = document.querySelector("video");
+    if (!v) {
+      return { attempted: false, reason: "no-video-element" };
+    }
+
+    if (!isVisiblePatchedMweb360Source()) {
+      return { attempted: false, reason: "visible-source-not-patched-mweb360" };
+    }
+
+    const candidates = [];
+
+    for (const result of warmup?.results || []) {
+      if (!result?.ok || !result?.json?.streamingData) continue;
+
+      const sd = result.json.streamingData;
+      const allFormats = [
+        ...(Array.isArray(sd.formats) ? sd.formats : []),
+        ...(Array.isArray(sd.adaptiveFormats) ? sd.adaptiveFormats : []),
+      ];
+
+      for (const format of allFormats) {
+        const url = format?.url || "";
+        if (!url) continue;
+
+        if (!/googlevideo\.com\/videoplayback/i.test(url)) continue;
+        if (/(?:[?&]|%26)sabr(?:=|%3D)1/i.test(url)) continue;
+
+        const itag = String(format.itag || "");
+        const mime = String(format.mimeType || "");
+        const codecs = mime.match(/codecs="([^"]+)"/)?.[1] || "";
+
+        const hasVideoShape =
+          mime.startsWith("video/") &&
+          (format.width || format.height || format.qualityLabel);
+
+        const hasAudioShape =
+          !!format.audioQuality ||
+          !!format.audioSampleRate ||
+          !!format.audioChannels ||
+          /mp4a|opus|vorbis/i.test(codecs);
+
+        const isAudioOnly =
+          mime.startsWith("audio/") ||
+          (!format.width && !format.height && hasAudioShape);
+
+        const isVideoOnly =
+          mime.startsWith("video/") &&
+          hasVideoShape &&
+          !hasAudioShape;
+
+        const isProgressiveAV =
+          mime.startsWith("video/") &&
+          hasVideoShape &&
+          hasAudioShape;
+
+        if (!isProgressiveAV) continue;
+
+        const height = Number(format.height || format.qualityLabel?.match(/\d+/)?.[0] || 0);
+
+        candidates.push({
+          url,
+          itag,
+          mime,
+          height,
+          qualityLabel: format.qualityLabel || "",
+          bitrate: Number(format.bitrate || 0),
+          hasVideoShape,
+          hasAudioShape,
+          isProgressiveAV,
+          sourceEndpoint: result.endpoint || result.sourceMode || "",
+          sourceMode: result.sourceMode || "",
+        });
+      }
+    }
+
+    candidates.sort((a, b) => b.height - a.height || b.bitrate - a.bitrate);
+
+    const candidateSummary = candidates.slice(0, 5).map(c => ({
+      itag: c.itag,
+      qualityLabel: c.qualityLabel,
+      height: c.height,
+      sourceMode: c.sourceMode,
+    }));
+
+    if (!candidates.length) {
+      remember({
+        event: "direct-source-swap-not-available",
+        reason: "no-safe-direct-progressive-av-candidate",
+        videoId,
+        candidateSummary,
+        videoState: summarizeVideoElementState(),
+      });
+
+      return { attempted: false, reason: "no-safe-direct-progressive-av-candidate" };
+    }
+
+    const candidate = candidates[0];
+
+    remember({
+      event: "direct-source-swap-candidate",
+      videoId,
+      candidate,
+      candidateSummary,
+      videoState: summarizeVideoElementState(),
+    });
+
+    try {
+      const before = summarizeVideoElementState();
+      const resumeAt = Number(v.currentTime || 0);
+      const wasPaused = !!v.paused;
+      const oldVolume = v.volume;
+      const oldMuted = v.muted;
+      const oldPlaybackRate = v.playbackRate;
+
+      v.src = candidate.url;
+      v.currentTime = resumeAt;
+      v.volume = oldVolume;
+      v.muted = oldMuted;
+      v.playbackRate = oldPlaybackRate;
+
+      remember({
+        event: "direct-source-swap-attempt",
+        videoId,
+        from: before,
+        candidate,
+      });
+
+      if (!wasPaused) {
+        v.play().catch(() => {});
+      }
+
+      remember({
+        event: "direct-source-swap-success",
+        videoId,
+        from: before,
+        to: summarizeVideoElementState(),
+        candidate,
+      });
+
+      return { attempted: true, ok: true };
+    } catch (err) {
+      remember({
+        event: "direct-source-swap-failed",
+        videoId,
+        error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
+        candidate,
+        videoState: summarizeVideoElementState(),
+      });
+
+      return { attempted: true, ok: false, error: `${err?.name || "Error"}: ${err?.message || String(err)}` };
+    }
+  }
+
   function scheduleBackgroundWarmupReadyCheck(videoId) {
     if (!isHybridStartupMode()) return;
     if (!videoId) return;
@@ -1601,12 +1760,30 @@ yt-source-swap-test.js text/javascript
         videoState: summarizeVideoElementState(),
       });
 
-      remember({
-        event: "source-swap-not-attempted",
-        reason: "no-true-seamless-swap-implemented",
-        videoId,
-        videoState: summarizeVideoElementState(),
-      });
+      const swapResult = attemptDirectWarmSourceSwap(videoId, warmup);
+
+      if (swapResult.attempted && swapResult.ok) {
+        remember({
+          event: "source-swap-attempted",
+          reason: swapResult.reason || "direct-video-src-swap",
+          videoId,
+          videoState: summarizeVideoElementState(),
+        });
+      } else if (swapResult.attempted && !swapResult.ok) {
+        remember({
+          event: "source-swap-failed",
+          reason: swapResult.reason || swapResult.error || "unknown",
+          videoId,
+          videoState: summarizeVideoElementState(),
+        });
+      } else {
+        remember({
+          event: "source-swap-not-attempted",
+          reason: swapResult.reason || "no-true-seamless-swap-implemented",
+          videoId,
+          videoState: summarizeVideoElementState(),
+        });
+      }
     }, 250);
   }
 
