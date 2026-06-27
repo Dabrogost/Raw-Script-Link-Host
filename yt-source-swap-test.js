@@ -101,6 +101,8 @@ yt-source-swap-test.js text/javascript
       quality: "hd720",
       keepOverlayAfterTransition: true,
       presentationMode: "visible-reload",
+      visiblePreload: true,
+      visiblePreloadLeadMs: 1200,
     },
     endpoints: {
       player: false,
@@ -2801,12 +2803,7 @@ yt-source-swap-test.js text/javascript
     };
   }
 
-  async function attemptAggressiveWarmReplayHandoff(videoId, warmup) {
-    const effectiveId = getCurrentEffectiveVideoId();
-    if (effectiveId && effectiveId !== videoId) {
-      return { attempted: false, ok: false, reason: "video-changed" };
-    }
-
+  function armWarmReplayFromWarmup(videoId, warmup, reason = "warm-replay") {
     const playerWarmup = (warmup?.results || []).find(r =>
       r?.ok && r?.json && (r.sourceMode || "").includes("player")
     );
@@ -2817,14 +2814,14 @@ yt-source-swap-test.js text/javascript
 
     if (!playerWarmup?.json) {
       remember({
-        event: "aggressive-handoff-not-available",
+        event: `${reason}-not-available`,
         reason: "no-warmed-player-json",
         videoId,
         warmupResults: warmup?.results || [],
         videoState: summarizeVideoElementState(),
       });
 
-      return { attempted: false, ok: false, reason: "no-warmed-player-json" };
+      return null;
     }
 
     const playerJson = cloneJson(playerWarmup.json);
@@ -2848,7 +2845,7 @@ yt-source-swap-test.js text/javascript
     handoffState.replay.resumeAt = Number(document.querySelector("video")?.currentTime || 0);
 
     remember({
-      event: "aggressive-handoff-armed",
+      event: `${reason}-armed`,
       videoId,
       resumeAt: handoffState.replay.resumeAt,
       hasPlayerJson: !!handoffState.replay.playerJson,
@@ -2856,13 +2853,135 @@ yt-source-swap-test.js text/javascript
       videoState: summarizeVideoElementState(),
     });
 
+    return {
+      resumeAt: handoffState.replay.resumeAt,
+      hasPlayerJson: !!handoffState.replay.playerJson,
+      hasNextJson: !!handoffState.replay.nextJson,
+    };
+  }
+
+  function tryNativeVisiblePreload(videoId, warmup, reason = "native-visible-preload") {
+    if (!config.hiddenWarmup?.visiblePreload) return false;
+
     const player = getMoviePlayer();
-    const resumeAt = handoffState.replay.resumeAt;
+    const armed = armWarmReplayFromWarmup(videoId, warmup, reason);
+    if (!armed) return false;
+
+    const resumeAt = armed.resumeAt;
+    const hasPreloadById = !!player && typeof player.preloadVideoById === "function";
+    const hasPreloadByVars = !!player && typeof player.preloadVideoByPlayerVars === "function";
+
+    remember({
+      event: `${reason}-start`,
+      videoId,
+      resumeAt,
+      hasPreloadById,
+      hasPreloadByVars,
+      videoState: summarizeVideoElementState(),
+    });
+
+    try {
+      if (hasPreloadById) {
+        player.preloadVideoById({
+          videoId,
+          startSeconds: Math.max(0, resumeAt),
+          suggestedQuality: config.hiddenWarmup.quality || "hd720",
+        });
+      } else if (hasPreloadByVars) {
+        player.preloadVideoByPlayerVars({
+          videoId,
+          start: Math.max(0, Math.floor(resumeAt)),
+          startSeconds: Math.max(0, resumeAt),
+          suggestedQuality: config.hiddenWarmup.quality || "hd720",
+        });
+      } else {
+        remember({
+          event: `${reason}-not-available`,
+          reason: "no-preload-method",
+          videoId,
+          resumeAt,
+        });
+
+        return false;
+      }
+
+      remember({
+        event: `${reason}-called`,
+        videoId,
+        resumeAt,
+        replayState: {
+          armed: handoffState.replay.armed,
+          playerHits: handoffState.replay.playerHits,
+          nextHits: handoffState.replay.nextHits,
+        },
+        videoState: summarizeVideoElementState(),
+      });
+
+      setTimeout(() => {
+        remember({
+          event: `${reason}-probe`,
+          videoId,
+          delayMs: Number(config.hiddenWarmup.visiblePreloadLeadMs || 1200),
+          replayState: {
+            armed: handoffState.replay.armed,
+            playerHits: handoffState.replay.playerHits,
+            nextHits: handoffState.replay.nextHits,
+          },
+          gaplessReady: (() => {
+            try {
+              return typeof player.isGaplessTransitionReady === "function"
+                ? player.isGaplessTransitionReady()
+                : null;
+            } catch {
+              return null;
+            }
+          })(),
+          videoState: summarizeVideoElementState(),
+        });
+      }, Number(config.hiddenWarmup.visiblePreloadLeadMs || 1200));
+
+      return true;
+    } catch (err) {
+      remember({
+        event: `${reason}-failed`,
+        videoId,
+        resumeAt,
+        error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
+        videoState: summarizeVideoElementState(),
+      });
+
+      return false;
+    }
+  }
+
+  async function attemptAggressiveWarmReplayHandoff(videoId, warmup) {
+    const effectiveId = getCurrentEffectiveVideoId();
+    if (effectiveId && effectiveId !== videoId) {
+      return { attempted: false, ok: false, reason: "video-changed" };
+    }
+
+    const armed = armWarmReplayFromWarmup(videoId, warmup, "aggressive-handoff");
+
+    if (!armed) {
+      return { attempted: false, ok: false, reason: "no-warmed-player-json" };
+    }
+
+    const player = getMoviePlayer();
+    const resumeAt = armed.resumeAt;
 
     remember({
       event: "aggressive-handoff-start",
       videoId,
       resumeAt,
+      gaplessReady: (() => {
+        try {
+          return player && typeof player.isGaplessTransitionReady === "function"
+            ? player.isGaplessTransitionReady()
+            : null;
+        } catch {
+          return null;
+        }
+      })(),
       videoState: summarizeVideoElementState(),
     });
 
@@ -3087,6 +3206,19 @@ yt-source-swap-test.js text/javascript
         warmupResults: warmup.results,
         videoState: summarizeVideoElementState(),
       });
+
+      if (config.hiddenWarmup?.visiblePreload) {
+        const preloadStarted = tryNativeVisiblePreload(videoId, warmup, "native-visible-preload");
+
+        remember({
+          event: preloadStarted
+            ? "native-visible-preload-started"
+            : "native-visible-preload-not-started",
+          reason: preloadStarted ? "preload-called" : "preload-unavailable",
+          videoId,
+          videoState: summarizeVideoElementState(),
+        });
+      }
 
       if (config.hiddenWarmup?.enabled) {
         const startedHiddenWarmup = startHiddenWarmupFromWarmup(videoId, warmup, "web-warmup-ready");
