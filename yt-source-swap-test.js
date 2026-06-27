@@ -100,6 +100,7 @@ yt-source-swap-test.js text/javascript
       opacityTransitionMs: 120,
       quality: "hd720",
       keepOverlayAfterTransition: true,
+      customControls: true,
     },
     endpoints: {
       player: false,
@@ -196,6 +197,7 @@ yt-source-swap-test.js text/javascript
     nudgeDone: false,
     lastProbeLogAt: 0,
     transitionAudio: null,
+    controls: null,
   };
 
   function log(...args) {
@@ -1696,11 +1698,48 @@ yt-source-swap-test.js text/javascript
     return rect;
   }
 
+  function getHiddenWarmupHost() {
+    return (
+      document.querySelector("#movie_player") ||
+      document.querySelector("ytd-player") ||
+      document.documentElement
+    );
+  }
+
   function alignHiddenWarmupOverlay() {
     if (!hiddenWarmState.container) return;
 
-    const rect = getVisiblePlayerBounds();
+    const host = getHiddenWarmupHost();
 
+    if (
+      host &&
+      host !== document.documentElement &&
+      hiddenWarmState.container.parentNode !== host
+    ) {
+      try {
+        host.appendChild(hiddenWarmState.container);
+      } catch {}
+    }
+
+    if (host && host !== document.documentElement) {
+      const computed = getComputedStyle(host);
+      if (computed.position === "static") {
+        host.style.position = "relative";
+      }
+
+      hiddenWarmState.container.style.position = "absolute";
+      hiddenWarmState.container.style.left = "0";
+      hiddenWarmState.container.style.top = "0";
+      hiddenWarmState.container.style.right = "0";
+      hiddenWarmState.container.style.bottom = "0";
+      hiddenWarmState.container.style.width = "100%";
+      hiddenWarmState.container.style.height = "100%";
+      return;
+    }
+
+    hiddenWarmState.container.style.position = "fixed";
+
+    const rect = getVisiblePlayerBounds();
     if (!rect) {
       hiddenWarmState.container.style.inset = "0";
       return;
@@ -2147,6 +2186,7 @@ yt-source-swap-test.js text/javascript
     hiddenWarmState.nudgeDone = false;
     hiddenWarmState.lastProbeLogAt = 0;
     hiddenWarmState.transitionAudio = null;
+    hiddenWarmState.controls = null;
   }
 
   function buildHiddenWarmupEmbedUrl(videoId, startSeconds) {
@@ -2185,6 +2225,7 @@ yt-source-swap-test.js text/javascript
     frame.style.height = "100%";
     frame.style.border = "0";
     frame.style.display = "block";
+    frame.style.pointerEvents = "none";
     frame.addEventListener("load", () => {
       installHiddenFrameReplayHooks("frame-load");
       remember({
@@ -2195,10 +2236,11 @@ yt-source-swap-test.js text/javascript
     });
 
     container.appendChild(frame);
-    document.documentElement.appendChild(container);
+    getHiddenWarmupHost().appendChild(container);
 
     hiddenWarmState.container = container;
     hiddenWarmState.frame = frame;
+    ensureHiddenWarmupControls();
 
     installHiddenFrameReplayHooks("before-src");
     frame.src = buildHiddenWarmupEmbedUrl(videoId, startSeconds);
@@ -2369,6 +2411,232 @@ yt-source-swap-test.js text/javascript
     }
   }
 
+  function formatClock(seconds) {
+    const n = Math.max(0, Number(seconds || 0));
+    const whole = Math.floor(n);
+    const h = Math.floor(whole / 3600);
+    const m = Math.floor((whole % 3600) / 60);
+    const s = whole % 60;
+
+    if (h > 0) {
+      return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+    }
+
+    return `${m}:${String(s).padStart(2, "0")}`;
+  }
+
+  function commandHiddenPlayer(func, args = []) {
+    const player = getHiddenWarmMoviePlayer();
+
+    try {
+      if (player && typeof player[func] === "function") {
+        return player[func](...args);
+      }
+    } catch (err) {
+      remember({
+        event: "hidden-controls-command-failed",
+        func,
+        error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
+      });
+    }
+
+    postHiddenWarmPlayerCommand(func, args);
+    return null;
+  }
+
+  function ensureHiddenWarmupControls() {
+    if (!config.hiddenWarmup?.customControls) return null;
+    if (!hiddenWarmState.container) return null;
+    if (hiddenWarmState.controls?.root) return hiddenWarmState.controls;
+
+    const root = document.createElement("div");
+    const play = document.createElement("button");
+    const mute = document.createElement("button");
+    const fs = document.createElement("button");
+    const time = document.createElement("span");
+    const seek = document.createElement("input");
+    const volume = document.createElement("input");
+
+    root.setAttribute("data-yt-source-swap-controls", "1");
+    root.style.position = "absolute";
+    root.style.left = "0";
+    root.style.right = "0";
+    root.style.bottom = "0";
+    root.style.zIndex = "2147483647";
+    root.style.display = "flex";
+    root.style.alignItems = "center";
+    root.style.gap = "8px";
+    root.style.padding = "8px 10px";
+    root.style.boxSizing = "border-box";
+    root.style.background = "linear-gradient(transparent, rgba(0,0,0,.78))";
+    root.style.color = "#fff";
+    root.style.font = "12px Arial, sans-serif";
+    root.style.pointerEvents = "auto";
+    root.style.opacity = "0";
+    root.style.transition = "opacity 120ms linear";
+
+    const styleButton = button => {
+      button.type = "button";
+      button.style.background = "rgba(20,20,20,.75)";
+      button.style.border = "1px solid rgba(255,255,255,.28)";
+      button.style.color = "#fff";
+      button.style.borderRadius = "4px";
+      button.style.height = "28px";
+      button.style.minWidth = "44px";
+      button.style.padding = "0 8px";
+      button.style.cursor = "pointer";
+    };
+
+    styleButton(play);
+    styleButton(mute);
+    styleButton(fs);
+
+    play.textContent = "Play";
+    mute.textContent = "Mute";
+    fs.textContent = "Full";
+
+    seek.type = "range";
+    seek.min = "0";
+    seek.max = "1000";
+    seek.step = "1";
+    seek.value = "0";
+    seek.style.flex = "1";
+    seek.style.minWidth = "120px";
+
+    volume.type = "range";
+    volume.min = "0";
+    volume.max = "100";
+    volume.step = "1";
+    volume.value = "100";
+    volume.style.width = "90px";
+
+    time.textContent = "0:00 / 0:00";
+    time.style.minWidth = "92px";
+    time.style.textAlign = "center";
+
+    play.addEventListener("click", event => {
+      event.preventDefault();
+      event.stopPropagation();
+
+      const hidden = getHiddenWarmVideo();
+      if (hidden?.paused) {
+        commandHiddenPlayer("playVideo");
+        Promise.resolve(hidden.play?.()).catch(() => {});
+      } else {
+        commandHiddenPlayer("pauseVideo");
+        try { hidden?.pause?.(); } catch {}
+      }
+    });
+
+    mute.addEventListener("click", event => {
+      event.preventDefault();
+      event.stopPropagation();
+
+      const hidden = getHiddenWarmVideo();
+      const shouldMute = !hidden?.muted;
+
+      if (hidden) hidden.muted = shouldMute;
+      commandHiddenPlayer(shouldMute ? "mute" : "unMute");
+
+      hiddenWarmState.transitionAudio = {
+        muted: shouldMute,
+        volume: Number(hidden?.volume ?? hiddenWarmState.transitionAudio?.volume ?? 1),
+      };
+    });
+
+    seek.addEventListener("input", event => {
+      event.stopPropagation();
+      const hidden = getHiddenWarmVideo();
+      const duration = Number(hidden?.duration || 0);
+      if (!duration) return;
+
+      const target = duration * (Number(seek.value || 0) / 1000);
+      try {
+        if (hidden) hidden.currentTime = target;
+      } catch {}
+      commandHiddenPlayer("seekTo", [target, true]);
+    });
+
+    volume.addEventListener("input", event => {
+      event.stopPropagation();
+      const nextVolume = Math.max(0, Math.min(1, Number(volume.value || 0) / 100));
+      const hidden = getHiddenWarmVideo();
+
+      if (hidden) {
+        hidden.volume = nextVolume;
+        hidden.muted = nextVolume === 0;
+      }
+
+      commandHiddenPlayer("setVolume", [Math.round(nextVolume * 100)]);
+      commandHiddenPlayer(nextVolume === 0 ? "mute" : "unMute");
+
+      hiddenWarmState.transitionAudio = {
+        muted: nextVolume === 0,
+        volume: nextVolume,
+      };
+    });
+
+    fs.addEventListener("click", event => {
+      event.preventDefault();
+      event.stopPropagation();
+
+      const host = getHiddenWarmupHost();
+      const target =
+        hiddenWarmState.container ||
+        (host !== document.documentElement ? host : null) ||
+        document.documentElement;
+
+      try {
+        if (document.fullscreenElement) {
+          document.exitFullscreen?.();
+        } else {
+          target.requestFullscreen?.();
+        }
+      } catch (err) {
+        remember({
+          event: "hidden-controls-fullscreen-failed",
+          error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
+        });
+      }
+    });
+
+    root.addEventListener("pointerdown", event => event.stopPropagation());
+    root.addEventListener("click", event => event.stopPropagation());
+
+    root.append(play, time, seek, mute, volume, fs);
+    hiddenWarmState.container.appendChild(root);
+
+    hiddenWarmState.controls = {
+      root,
+      play,
+      mute,
+      fs,
+      time,
+      seek,
+      volume,
+    };
+
+    return hiddenWarmState.controls;
+  }
+
+  function updateHiddenWarmupControls() {
+    const controls = ensureHiddenWarmupControls();
+    if (!controls) return;
+
+    const hidden = getHiddenWarmVideo();
+    const duration = Number(hidden?.duration || 0);
+    const currentTime = Number(hidden?.currentTime || 0);
+    const volume = Number(hidden?.volume ?? 1);
+
+    controls.root.style.opacity = hiddenWarmState.transitioned ? "1" : "0";
+    controls.play.textContent = hidden?.paused ? "Play" : "Pause";
+    controls.mute.textContent = hidden?.muted ? "Unmute" : "Mute";
+    controls.fs.textContent = document.fullscreenElement ? "Exit" : "Full";
+    controls.time.textContent = `${formatClock(currentTime)} / ${duration ? formatClock(duration) : "0:00"}`;
+    controls.seek.value = duration ? String(Math.round((currentTime / duration) * 1000)) : "0";
+    controls.volume.value = String(Math.round(volume * 100));
+  }
+
   function transitionToHiddenWarmup(reason = "ready") {
     if (!config.hiddenWarmup.transition) return false;
     if (hiddenWarmState.transitioned) return true;
@@ -2427,6 +2695,7 @@ yt-source-swap-test.js text/javascript
       hiddenWarmState.container.style.pointerEvents = "auto";
       hiddenWarmState.container.style.opacity = "1";
     }
+    updateHiddenWarmupControls();
 
     setTimeout(() => {
       try {
@@ -2442,6 +2711,7 @@ yt-source-swap-test.js text/javascript
     hiddenWarmState.ready = true;
 
     driveHiddenWarmupPlayback("post-transition");
+    updateHiddenWarmupControls();
 
     remember({
       event: "hidden-warmup-transition",
@@ -2469,6 +2739,7 @@ yt-source-swap-test.js text/javascript
     alignHiddenWarmupOverlay();
     installHiddenFrameReplayHooks("poll");
     driveHiddenWarmupPlayback("poll");
+    updateHiddenWarmupControls();
     const sync = syncHiddenWarmupToVisible("poll");
 
     const hiddenState = summarizeHiddenWarmVideoState();
@@ -4306,6 +4577,26 @@ yt-source-swap-test.js text/javascript
 
   let lastObservedVideoId = "";
 
+  document.addEventListener("fullscreenchange", () => {
+    if (!hiddenWarmState.container) return;
+
+    alignHiddenWarmupOverlay();
+    updateHiddenWarmupControls();
+
+    remember({
+      event: "hidden-warmup-fullscreenchange",
+      videoId: hiddenWarmState.videoId,
+      fullscreenElement: document.fullscreenElement
+        ? (
+            document.fullscreenElement.id ||
+            document.fullscreenElement.tagName ||
+            "element"
+          )
+        : "",
+      hiddenState: summarizeHiddenWarmVideoState(),
+    });
+  });
+
   setInterval(() => {
     const current = getCurrentEffectiveVideoId();
 
@@ -4432,6 +4723,22 @@ yt-source-swap-test.js text/javascript
           nudgeDone: hiddenWarmState.nudgeDone,
           transitionAudio: hiddenWarmState.transitionAudio,
           lastProbe: hiddenWarmState.lastProbe,
+        },
+        overlay: {
+          hasContainer: !!hiddenWarmState.container,
+          parentId: hiddenWarmState.container?.parentElement?.id || "",
+          parentTag: hiddenWarmState.container?.parentElement?.tagName || "",
+          position: hiddenWarmState.container?.style?.position || "",
+          pointerEvents: hiddenWarmState.container?.style?.pointerEvents || "",
+          opacity: hiddenWarmState.container?.style?.opacity || "",
+          hasControls: !!hiddenWarmState.controls?.root,
+          fullscreenElement: document.fullscreenElement
+            ? (
+                document.fullscreenElement.id ||
+                document.fullscreenElement.tagName ||
+                "element"
+              )
+            : "",
         },
         frame: getHiddenWarmFrameDebug(),
         visibleState: summarizeVideoElementState(),
