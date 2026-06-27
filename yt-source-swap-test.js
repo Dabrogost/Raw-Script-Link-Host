@@ -1470,7 +1470,69 @@ yt-source-swap-test.js text/javascript
     return record;
   }
 
-  function attemptDirectWarmSourceSwap(videoId, warmup) {
+  function waitForVideoEventOrTimeout(video, eventNames, timeoutMs = 4000) {
+    return new Promise(resolve => {
+      let done = false;
+
+      const cleanup = result => {
+        if (done) return;
+        done = true;
+
+        clearTimeout(timer);
+
+        for (const name of eventNames) {
+          video.removeEventListener(name, onEvent, true);
+        }
+
+        resolve(result);
+      };
+
+      const onEvent = event => {
+        cleanup({
+          ok: true,
+          event: event.type,
+        });
+      };
+
+      const timer = setTimeout(() => {
+        cleanup({
+          ok: false,
+          event: "timeout",
+        });
+      }, timeoutMs);
+
+      for (const name of eventNames) {
+        video.addEventListener(name, onEvent, true);
+      }
+    });
+  }
+
+  function summarizeSourceIdentity(url) {
+    try {
+      const u = new URL(String(url || ""));
+      return {
+        host: u.hostname,
+        path: u.pathname,
+        itag: u.searchParams.get("itag") || "",
+        id: u.searchParams.get("id") || "",
+        c: u.searchParams.get("c") || "",
+        hasSabr:
+          u.searchParams.has("sabr") ||
+          /(?:[?&]|%26)sabr(?:=|%3D)1/i.test(String(url || "")),
+      };
+    } catch {
+      return {
+        host: "",
+        path: "",
+        itag: "",
+        id: "",
+        c: "",
+        hasSabr: false,
+      };
+    }
+  }
+
+  async function attemptDirectWarmSourceSwap(videoId, warmup) {
     const effectiveId = getCurrentEffectiveVideoId();
     if (effectiveId && effectiveId !== videoId) {
       return { attempted: false, reason: "video-changed" };
@@ -1573,17 +1635,19 @@ yt-source-swap-test.js text/javascript
     }
 
     const candidate = candidates[0];
+    const mechanismTest = candidate.itag === "18" && candidate.height <= 360;
 
     remember({
       event: "direct-source-swap-candidate",
       videoId,
-      candidate,
+      candidate: { ...candidate, mechanismTest },
       candidateSummary,
       videoState: summarizeVideoElementState(),
     });
 
     try {
       const before = summarizeVideoElementState();
+      const candidateIdentity = summarizeSourceIdentity(candidate.url);
       const resumeAt = Number(v.currentTime || 0);
       const wasPaused = !!v.paused;
       const oldVolume = v.volume;
@@ -1600,19 +1664,82 @@ yt-source-swap-test.js text/javascript
         event: "direct-source-swap-attempt",
         videoId,
         from: before,
-        candidate,
+        candidate: { ...candidate, mechanismTest },
       });
 
       if (!wasPaused) {
         v.play().catch(() => {});
       }
 
+      const waitResult = await waitForVideoEventOrTimeout(v, [
+        "loadedmetadata",
+        "canplay",
+        "playing",
+      ], 4000);
+
+      const after = summarizeVideoElementState();
+      const afterIdentity = summarizeSourceIdentity(v.currentSrc);
+
+      const candidateIdMatches =
+        !!candidateIdentity.id &&
+        !!afterIdentity.id &&
+        afterIdentity.id === candidateIdentity.id;
+
+      const candidateHostPathItagMatches =
+        !!candidateIdentity.host &&
+        !!afterIdentity.host &&
+        afterIdentity.host === candidateIdentity.host &&
+        afterIdentity.path === candidateIdentity.path &&
+        afterIdentity.itag === candidateIdentity.itag;
+
+      const srcLooksCorrect =
+        /googlevideo\.com\/videoplayback/i.test(v.currentSrc || "") &&
+        afterIdentity.itag === candidateIdentity.itag &&
+        !afterIdentity.hasSabr &&
+        (candidateIdMatches || candidateHostPathItagMatches);
+
+      const noError = !v.error;
+      const readyOk = v.readyState >= 2;
+      const timeOk = Math.abs(after.currentTime - resumeAt) < 2;
+      const playingOk = wasPaused || !after.paused;
+
+      let verifyReason = "";
+      if (!srcLooksCorrect) verifyReason = "src-mismatch";
+      else if (!noError) verifyReason = "video-error";
+      else if (!readyOk) verifyReason = "readyState-low";
+      else if (!timeOk) verifyReason = "time-reset";
+      else if (!playingOk) verifyReason = "playback-stopped";
+
+      if (!waitResult.ok || verifyReason) {
+        remember({
+          event: "direct-source-swap-verify-failed",
+          videoId,
+          reason: verifyReason || "wait-failed",
+          candidate: { ...candidate, mechanismTest },
+          candidateIdentity,
+          candidateIdMatches,
+          candidateHostPathItagMatches,
+          srcLooksCorrect,
+          before,
+          after,
+          afterIdentity,
+          waitResult,
+        });
+
+        return { attempted: true, ok: false, reason: verifyReason || "verify-failed" };
+      }
+
       remember({
         event: "direct-source-swap-success",
         videoId,
         from: before,
-        to: summarizeVideoElementState(),
-        candidate,
+        to: after,
+        candidate: { ...candidate, mechanismTest },
+        candidateIdentity,
+        candidateIdMatches,
+        candidateHostPathItagMatches,
+        srcLooksCorrect,
+        waitResult,
       });
 
       return { attempted: true, ok: true };
@@ -1647,7 +1774,7 @@ yt-source-swap-test.js text/javascript
       effectiveVideoId: getCurrentEffectiveVideoId(),
     });
 
-    hybridState.pendingHandoffTimer = setInterval(() => {
+    hybridState.pendingHandoffTimer = setInterval(async () => {
       const v = document.querySelector("video");
       const pageVideoId = getCurrentPageVideoId();
       const urlVideoId = getCurrentUrlVideoId();
@@ -1760,7 +1887,7 @@ yt-source-swap-test.js text/javascript
         videoState: summarizeVideoElementState(),
       });
 
-      const swapResult = attemptDirectWarmSourceSwap(videoId, warmup);
+      const swapResult = await attemptDirectWarmSourceSwap(videoId, warmup);
 
       if (swapResult.attempted && swapResult.ok) {
         remember({
