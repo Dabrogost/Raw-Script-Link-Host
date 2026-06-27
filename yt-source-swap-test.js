@@ -1796,6 +1796,45 @@ yt-source-swap-test.js text/javascript
       const oldMuted = v.muted;
       const oldPlaybackRate = v.playbackRate;
 
+      const visibleSnapshot = summarizeVideoElementStateWithIdentity();
+      const visibleStartupUrl = visibleSnapshot.state.currentSrc || "";
+      let visibleControlProbeResult = null;
+
+      if (
+        /googlevideo\.com\/videoplayback/i.test(visibleStartupUrl) &&
+        !/(?:[?&]|%26)sabr(?:=|%3D)1/i.test(visibleStartupUrl)
+      ) {
+        const visibleStartupControlCandidate = {
+          url: visibleStartupUrl,
+          itag: "18",
+          mime: "video/mp4",
+          height: 360,
+          qualityLabel: "360p",
+          bitrate: 0,
+          sourceEndpoint: "visible-current-src-control",
+          sourceMode: "visible-current-src-control",
+          mechanismTest: true,
+        };
+
+        remember({
+          event: "direct-source-swap-hidden-control-probe-start",
+          videoId,
+          visibleStartupControlCandidate,
+          visibleSnapshot,
+        });
+
+        visibleControlProbeResult =
+          await probeDirectCandidateInHiddenVideo(videoId, visibleStartupControlCandidate);
+
+        remember({
+          event: "direct-source-swap-hidden-control-probe",
+          videoId,
+          visibleStartupControlCandidate,
+          visibleControlProbeResult,
+          visibleSnapshot,
+        });
+      }
+
       remember({
         event: "direct-source-swap-hidden-probe-start",
         videoId,
@@ -1813,6 +1852,7 @@ yt-source-swap-test.js text/javascript
           videoId,
           candidate: { ...candidate, mechanismTest },
           probeResult: hiddenProbeResult,
+          visibleControlProbeResult,
           videoState: summarizeVideoElementState(),
         });
 
