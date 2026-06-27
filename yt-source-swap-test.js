@@ -103,6 +103,7 @@ yt-source-swap-test.js text/javascript
       presentationMode: "visible-reload",
       visiblePreload: true,
       visiblePreloadLeadMs: 1200,
+      visiblePreloadVariantGapMs: 250,
     },
     endpoints: {
       player: false,
@@ -2870,6 +2871,7 @@ yt-source-swap-test.js text/javascript
     const resumeAt = armed.resumeAt;
     const hasPreloadById = !!player && typeof player.preloadVideoById === "function";
     const hasPreloadByVars = !!player && typeof player.preloadVideoByPlayerVars === "function";
+    const hasGaplessReady = !!player && typeof player.isGaplessTransitionReady === "function";
 
     remember({
       event: `${reason}-start`,
@@ -2877,51 +2879,120 @@ yt-source-swap-test.js text/javascript
       resumeAt,
       hasPreloadById,
       hasPreloadByVars,
+      hasGaplessReady,
+      preloadByIdLength: hasPreloadById ? player.preloadVideoById.length : null,
+      preloadByVarsLength: hasPreloadByVars ? player.preloadVideoByPlayerVars.length : null,
       videoState: summarizeVideoElementState(),
     });
 
-    try {
-      if (hasPreloadById) {
-        player.preloadVideoById({
+    const variants = [];
+
+    if (hasPreloadById) {
+      variants.push({
+        name: "preloadVideoById-object",
+        call: () => player.preloadVideoById({
           videoId,
           startSeconds: Math.max(0, resumeAt),
           suggestedQuality: config.hiddenWarmup.quality || "hd720",
-        });
-      } else if (hasPreloadByVars) {
-        player.preloadVideoByPlayerVars({
+        }),
+      });
+
+      variants.push({
+        name: "preloadVideoById-args",
+        call: () => player.preloadVideoById(
+          videoId,
+          Math.max(0, resumeAt),
+          config.hiddenWarmup.quality || "hd720"
+        ),
+      });
+    }
+
+    if (hasPreloadByVars) {
+      variants.push({
+        name: "preloadVideoByPlayerVars-object",
+        call: () => player.preloadVideoByPlayerVars({
           videoId,
           start: Math.max(0, Math.floor(resumeAt)),
           startSeconds: Math.max(0, resumeAt),
           suggestedQuality: config.hiddenWarmup.quality || "hd720",
-        });
-      } else {
-        remember({
-          event: `${reason}-not-available`,
-          reason: "no-preload-method",
-          videoId,
-          resumeAt,
-        });
+        }),
+      });
+    }
 
-        return false;
-      }
-
+    if (!variants.length) {
       remember({
-        event: `${reason}-called`,
+        event: `${reason}-not-available`,
+        reason: "no-preload-method",
         videoId,
         resumeAt,
-        replayState: {
-          armed: handoffState.replay.armed,
-          playerHits: handoffState.replay.playerHits,
-          nextHits: handoffState.replay.nextHits,
-        },
-        videoState: summarizeVideoElementState(),
       });
 
+      return false;
+    }
+
+    const variantGapMs = Number(config.hiddenWarmup.visiblePreloadVariantGapMs || 250);
+
+    for (let i = 0; i < variants.length; i++) {
+      const variant = variants[i];
+
+      setTimeout(() => {
+        try {
+          const beforeHits = {
+            playerHits: handoffState.replay.playerHits,
+            nextHits: handoffState.replay.nextHits,
+          };
+
+          variant.call();
+
+          remember({
+            event: `${reason}-called`,
+            variant: variant.name,
+            videoId,
+            resumeAt,
+            beforeHits,
+            replayState: {
+              armed: handoffState.replay.armed,
+              playerHits: handoffState.replay.playerHits,
+              nextHits: handoffState.replay.nextHits,
+            },
+            gaplessReady: (() => {
+              try {
+                return hasGaplessReady ? player.isGaplessTransitionReady() : null;
+              } catch {
+                return null;
+              }
+            })(),
+            videoState: summarizeVideoElementState(),
+          });
+        } catch (err) {
+          remember({
+            event: `${reason}-variant-failed`,
+            variant: variant.name,
+            videoId,
+            resumeAt,
+            error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
+            replayState: {
+              armed: handoffState.replay.armed,
+              playerHits: handoffState.replay.playerHits,
+              nextHits: handoffState.replay.nextHits,
+            },
+            videoState: summarizeVideoElementState(),
+          });
+        }
+      }, i * variantGapMs);
+    }
+
+    const probeDelays = [
+      Number(config.hiddenWarmup.visiblePreloadLeadMs || 1200),
+      Number(config.hiddenWarmup.visiblePreloadLeadMs || 1200) + (variants.length * variantGapMs) + 1000,
+    ];
+
+    for (const delayMs of probeDelays) {
       setTimeout(() => {
         remember({
           event: `${reason}-probe`,
           videoId,
-          delayMs: Number(config.hiddenWarmup.visiblePreloadLeadMs || 1200),
+          delayMs,
           replayState: {
             armed: handoffState.replay.armed,
             playerHits: handoffState.replay.playerHits,
@@ -2929,7 +3000,7 @@ yt-source-swap-test.js text/javascript
           },
           gaplessReady: (() => {
             try {
-              return typeof player.isGaplessTransitionReady === "function"
+              return hasGaplessReady
                 ? player.isGaplessTransitionReady()
                 : null;
             } catch {
@@ -2938,20 +3009,10 @@ yt-source-swap-test.js text/javascript
           })(),
           videoState: summarizeVideoElementState(),
         });
-      }, Number(config.hiddenWarmup.visiblePreloadLeadMs || 1200));
-
-      return true;
-    } catch (err) {
-      remember({
-        event: `${reason}-failed`,
-        videoId,
-        resumeAt,
-        error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
-        videoState: summarizeVideoElementState(),
-      });
-
-      return false;
+      }, delayMs);
     }
+
+    return true;
   }
 
   async function attemptAggressiveWarmReplayHandoff(videoId, warmup) {
