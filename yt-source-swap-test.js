@@ -128,19 +128,29 @@ yt-source-swap-test.js text/javascript
     requestVideoId: "",
   };
 
-  const hybridState = {
-    handoffAttemptedByVideoId: new Map(),
-    pendingHandoffTimer: null,
+  const handoffState = {
+    attemptedByVideoId: new Map(),
+    pendingTimer: null,
     activeVideoId: "",
     activePatchVideoId: "",
-    handoffInProgress: false,
+    inProgress: false,
+
+    warmupByVideoId: new Map(),
+
+    replay: {
+      armed: false,
+      videoId: "",
+      expiresAt: 0,
+      playerJson: null,
+      nextJson: null,
+      playerHits: 0,
+      nextHits: 0,
+      startedAt: 0,
+      resumeAt: 0,
+    },
   };
 
   const HYBRID_SESSION_KEY = "__yt_source_swap_hybrid_handoff__";
-
-  const hybridWarmupState = {
-    byVideoId: new Map(),
-  };
 
   function log(...args) {
     if (config.logVerbose) {
@@ -1343,31 +1353,31 @@ yt-source-swap-test.js text/javascript
     return url.toString();
   }
 
-  function hasHybridHandoffRecently(videoId) {
+  function hasHandoffRecently(videoId) {
     if (!videoId) return false;
 
     const persisted = getActivePersistedHybridBypass(videoId);
     if (persisted) return true;
 
-    if (!hybridState.handoffAttemptedByVideoId.has(videoId)) {
+    if (!handoffState.attemptedByVideoId.has(videoId)) {
       return false;
     }
 
-    const last = hybridState.handoffAttemptedByVideoId.get(videoId);
+    const last = handoffState.attemptedByVideoId.get(videoId);
     const age = performance.now() - last;
 
     return age >= 0 && age < Number(config.hybridStartup.handoffCooldownMs || 30000);
   }
 
-  function markHybridHandoffAttempted(videoId) {
+  function markHandoffAttempted(videoId) {
     if (!videoId) return;
-    hybridState.handoffAttemptedByVideoId.set(videoId, performance.now());
+    handoffState.attemptedByVideoId.set(videoId, performance.now());
   }
 
-  function clearHybridHandoffTimer() {
-    if (hybridState.pendingHandoffTimer) {
-      clearInterval(hybridState.pendingHandoffTimer);
-      hybridState.pendingHandoffTimer = null;
+  function clearHandoffTimer() {
+    if (handoffState.pendingTimer) {
+      clearInterval(handoffState.pendingTimer);
+      handoffState.pendingTimer = null;
     }
   }
 
@@ -1375,7 +1385,7 @@ yt-source-swap-test.js text/javascript
     if (!isHybridStartupMode()) return null;
     if (!videoId) return null;
 
-    const existing = hybridWarmupState.byVideoId.get(videoId);
+    const existing = handoffState.warmupByVideoId.get(videoId);
     if (existing) return existing;
 
     const record = {
@@ -1388,7 +1398,7 @@ yt-source-swap-test.js text/javascript
       results: [],
     };
 
-    hybridWarmupState.byVideoId.set(videoId, record);
+    handoffState.warmupByVideoId.set(videoId, record);
 
     remember({
       event: "hybrid-warmup-start",
@@ -1470,589 +1480,158 @@ yt-source-swap-test.js text/javascript
     return record;
   }
 
-  function summarizeSpecificVideoElementStateWithIdentity(video) {
-    if (!video) {
-      return {
-        state: { hasVideo: false },
-        identity: summarizeSourceIdentity(""),
-      };
-    }
-
-    const currentSrc = String(video.currentSrc || "");
-
-    const state = {
-      hasVideo: true,
-      currentSrc,
-      readyState: video.readyState,
-      networkState: video.networkState,
-      paused: video.paused,
-      currentTime: video.currentTime,
-      duration: video.duration,
-      error: video.error
-        ? {
-            code: video.error.code,
-            message: video.error.message,
-          }
-        : null,
-    };
-
-    return {
-      state,
-      identity: summarizeSourceIdentity(currentSrc),
-    };
-  }
-
-  function summarizeVideoElementStateWithIdentity() {
-    return summarizeSpecificVideoElementStateWithIdentity(document.querySelector("video"));
-  }
-
   function delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
-  function waitForVideoEventOrTimeout(video, eventNames, timeoutMs = 4000) {
-    return new Promise(resolve => {
-      let done = false;
-
-      const cleanup = result => {
-        if (done) return;
-        done = true;
-
-        clearTimeout(timer);
-
-        for (const name of eventNames) {
-          video.removeEventListener(name, onEvent, true);
-        }
-
-        resolve(result);
-      };
-
-      const onEvent = event => {
-        cleanup({
-          ok: true,
-          event: event.type,
-        });
-      };
-
-      const timer = setTimeout(() => {
-        cleanup({
-          ok: false,
-          event: "timeout",
-        });
-      }, timeoutMs);
-
-      for (const name of eventNames) {
-        video.addEventListener(name, onEvent, true);
-      }
-    });
-  }
-
-  function summarizeSourceIdentity(url) {
-    try {
-      const u = new URL(String(url || ""));
-      return {
-        host: u.hostname,
-        path: u.pathname,
-        itag: u.searchParams.get("itag") || "",
-        id: u.searchParams.get("id") || "",
-        c: u.searchParams.get("c") || "",
-        hasSabr:
-          u.searchParams.has("sabr") ||
-          /(?:[?&]|%26)sabr(?:=|%3D)1/i.test(String(url || "")),
-      };
-    } catch {
-      return {
-        host: "",
-        path: "",
-        itag: "",
-        id: "",
-        c: "",
-        hasSabr: false,
-      };
-    }
-  }
-
-  async function probeDirectCandidateInHiddenVideo(videoId, candidate, timeoutMs = 5000) {
-    const candidateIdentity = summarizeSourceIdentity(candidate.url);
-
-    const hidden = document.createElement("video");
-    hidden.muted = true;
-    hidden.playsInline = true;
-    hidden.preload = "auto";
-    hidden.style.position = "fixed";
-    hidden.style.left = "-99999px";
-    hidden.style.top = "-99999px";
-    hidden.style.width = "1px";
-    hidden.style.height = "1px";
-    hidden.style.opacity = "0";
-    hidden.style.pointerEvents = "none";
-    hidden.setAttribute("aria-hidden", "true");
-
-    document.documentElement.appendChild(hidden);
-
-    const waitPromise = waitForVideoEventOrTimeout(hidden, [
-      "loadedmetadata",
-      "canplay",
-      "playing",
-      "error",
-    ], timeoutMs);
-
-    hidden.src = candidate.url;
-
-    if (typeof hidden.load === "function") {
-      hidden.load();
+  async function attemptAggressiveWarmReplayHandoff(videoId, warmup) {
+    const effectiveId = getCurrentEffectiveVideoId();
+    if (effectiveId && effectiveId !== videoId) {
+      return { attempted: false, ok: false, reason: "video-changed" };
     }
 
-    const waitResult = await waitPromise;
+    const playerWarmup = (warmup?.results || []).find(r =>
+      r?.ok && r?.json && (r.sourceMode || "").includes("player")
+    );
 
-    const afterSnapshot = summarizeSpecificVideoElementStateWithIdentity(hidden);
-    const state = afterSnapshot.state;
-    const identity = afterSnapshot.identity;
+    const nextWarmup = (warmup?.results || []).find(r =>
+      r?.ok && r?.json && (r.sourceMode || "").includes("next")
+    );
 
-    const idMatches =
-      !!candidateIdentity.id &&
-      !!identity.id &&
-      identity.id === candidateIdentity.id;
+    if (!playerWarmup?.json) {
+      remember({
+        event: "aggressive-handoff-not-available",
+        reason: "no-warmed-player-json",
+        videoId,
+        warmupResults: warmup?.results || [],
+        videoState: summarizeVideoElementState(),
+      });
 
-    const hostPathItagMatches =
-      !!candidateIdentity.host &&
-      !!identity.host &&
-      identity.host === candidateIdentity.host &&
-      identity.path === candidateIdentity.path &&
-      identity.itag === candidateIdentity.itag;
+      return { attempted: false, ok: false, reason: "no-warmed-player-json" };
+    }
 
-    const srcLooksCorrect =
-      /googlevideo\.com\/videoplayback/i.test(state.currentSrc || "") &&
-      identity.itag === candidateIdentity.itag &&
-      !identity.hasSabr &&
-      (idMatches || hostPathItagMatches);
-
-    const noError = !state.error;
-    const readyOk = Number(state.readyState || 0) >= 1;
-
-    let reason = "";
-    if (!srcLooksCorrect) reason = "src-mismatch";
-    else if (!noError) reason = `video-error-${state.error?.code || "?"}`;
-    else if (!readyOk) reason = "readyState-low";
-
-    const ok = !reason;
+    const playerJson = cloneJson(playerWarmup.json);
 
     try {
-      hidden.pause();
-      hidden.removeAttribute("src");
-      if (typeof hidden.load === "function") {
-        hidden.load();
+      stripPlayerAdState(playerJson);
+      const players = findPlayerLikeObjects(playerJson);
+      for (const p of players) {
+        if (p.value) stripPlayerAdState(p.value);
       }
     } catch {}
 
-    if (hidden.parentNode) {
-      hidden.parentNode.removeChild(hidden);
-    }
-
-    const result = {
-      ok,
-      reason: reason || "ok",
-      candidateIdentity,
-      state,
-      identity,
-      waitResult: waitResult.event,
-      idMatches,
-      hostPathItagMatches,
-      srcLooksCorrect,
-    };
+    handoffState.replay.armed = true;
+    handoffState.replay.videoId = videoId;
+    handoffState.replay.expiresAt = performance.now() + 8000;
+    handoffState.replay.playerJson = playerJson;
+    handoffState.replay.nextJson = nextWarmup?.json ? cloneJson(nextWarmup.json) : null;
+    handoffState.replay.playerHits = 0;
+    handoffState.replay.nextHits = 0;
+    handoffState.replay.startedAt = performance.now();
+    handoffState.replay.resumeAt = Number(document.querySelector("video")?.currentTime || 0);
 
     remember({
-      event: "direct-source-swap-hidden-probe",
+      event: "aggressive-handoff-armed",
       videoId,
-      candidate,
-      candidateIdentity,
-      ...result,
-    });
-
-    return result;
-  }
-
-  async function attemptDirectWarmSourceSwap(videoId, warmup) {
-    const effectiveId = getCurrentEffectiveVideoId();
-    if (effectiveId && effectiveId !== videoId) {
-      return { attempted: false, reason: "video-changed" };
-    }
-
-    const v = document.querySelector("video");
-    if (!v) {
-      return { attempted: false, reason: "no-video-element" };
-    }
-
-    if (!isVisiblePatchedMweb360Source()) {
-      return { attempted: false, reason: "visible-source-not-patched-mweb360" };
-    }
-
-    const candidates = [];
-
-    for (const result of warmup?.results || []) {
-      if (!result?.ok || !result?.json?.streamingData) continue;
-
-      const sd = result.json.streamingData;
-      const allFormats = [
-        ...(Array.isArray(sd.formats) ? sd.formats : []),
-        ...(Array.isArray(sd.adaptiveFormats) ? sd.adaptiveFormats : []),
-      ];
-
-      for (const format of allFormats) {
-        const url = format?.url || "";
-        if (!url) continue;
-
-        if (!/googlevideo\.com\/videoplayback/i.test(url)) continue;
-        if (/(?:[?&]|%26)sabr(?:=|%3D)1/i.test(url)) continue;
-
-        const itag = String(format.itag || "");
-        const mime = String(format.mimeType || "");
-        const codecs = mime.match(/codecs="([^"]+)"/)?.[1] || "";
-
-        const hasVideoShape =
-          mime.startsWith("video/") &&
-          (format.width || format.height || format.qualityLabel);
-
-        const hasAudioShape =
-          !!format.audioQuality ||
-          !!format.audioSampleRate ||
-          !!format.audioChannels ||
-          /mp4a|opus|vorbis/i.test(codecs);
-
-        const isAudioOnly =
-          mime.startsWith("audio/") ||
-          (!format.width && !format.height && hasAudioShape);
-
-        const isVideoOnly =
-          mime.startsWith("video/") &&
-          hasVideoShape &&
-          !hasAudioShape;
-
-        const isProgressiveAV =
-          mime.startsWith("video/") &&
-          hasVideoShape &&
-          hasAudioShape;
-
-        if (!isProgressiveAV) continue;
-
-        const height = Number(format.height || format.qualityLabel?.match(/\d+/)?.[0] || 0);
-
-        candidates.push({
-          url,
-          itag,
-          mime,
-          height,
-          qualityLabel: format.qualityLabel || "",
-          bitrate: Number(format.bitrate || 0),
-          hasVideoShape,
-          hasAudioShape,
-          isProgressiveAV,
-          sourceEndpoint: result.endpoint || result.sourceMode || "",
-          sourceMode: result.sourceMode || "",
-        });
-      }
-    }
-
-    candidates.sort((a, b) => b.height - a.height || b.bitrate - a.bitrate);
-
-    const candidateSummary = candidates.slice(0, 5).map(c => ({
-      itag: c.itag,
-      qualityLabel: c.qualityLabel,
-      height: c.height,
-      sourceMode: c.sourceMode,
-    }));
-
-    if (!candidates.length) {
-      remember({
-        event: "direct-source-swap-not-available",
-        reason: "no-safe-direct-progressive-av-candidate",
-        videoId,
-        candidateSummary,
-        videoState: summarizeVideoElementState(),
-      });
-
-      return { attempted: false, reason: "no-safe-direct-progressive-av-candidate" };
-    }
-
-    const candidate = candidates[0];
-    const mechanismTest = candidate.itag === "18" && candidate.height <= 360;
-
-    remember({
-      event: "direct-source-swap-candidate",
-      videoId,
-      candidate: { ...candidate, mechanismTest },
-      candidateSummary,
+      resumeAt: handoffState.replay.resumeAt,
+      hasPlayerJson: !!handoffState.replay.playerJson,
+      hasNextJson: !!handoffState.replay.nextJson,
       videoState: summarizeVideoElementState(),
     });
 
-    try {
-      const beforeSnapshot = summarizeVideoElementStateWithIdentity();
-      const before = beforeSnapshot.state;
-      const beforeIdentity = beforeSnapshot.identity;
-      const candidateIdentity = summarizeSourceIdentity(candidate.url);
-      const resumeAt = Number(v.currentTime || 0);
-      const wasPaused = !!v.paused;
-      const oldVolume = v.volume;
-      const oldMuted = v.muted;
-      const oldPlaybackRate = v.playbackRate;
+    const player = getMoviePlayer();
+    const resumeAt = handoffState.replay.resumeAt;
 
-      const visibleSnapshot = summarizeVideoElementStateWithIdentity();
-      const visibleStartupUrl = visibleSnapshot.state.currentSrc || "";
-      let visibleControlProbeResult = null;
+    remember({
+      event: "aggressive-handoff-start",
+      videoId,
+      resumeAt,
+      videoState: summarizeVideoElementState(),
+    });
 
-      if (
-        /googlevideo\.com\/videoplayback/i.test(visibleStartupUrl) &&
-        !/(?:[?&]|%26)sabr(?:=|%3D)1/i.test(visibleStartupUrl)
-      ) {
-        const visibleStartupControlCandidate = {
-          url: visibleStartupUrl,
-          itag: "18",
-          mime: "video/mp4",
-          height: 360,
-          qualityLabel: "360p",
-          bitrate: 0,
-          sourceEndpoint: "visible-current-src-control",
-          sourceMode: "visible-current-src-control",
-          mechanismTest: true,
-        };
-
-        remember({
-          event: "direct-source-swap-hidden-control-probe-start",
+    if (player && typeof player.loadVideoById === "function") {
+      try {
+        player.loadVideoById({
           videoId,
-          visibleStartupControlCandidate,
-          visibleSnapshot,
+          startSeconds: Math.max(0, resumeAt),
+          suggestedQuality: "hd720",
         });
 
-        visibleControlProbeResult =
-          await probeDirectCandidateInHiddenVideo(videoId, visibleStartupControlCandidate);
-
         remember({
-          event: "direct-source-swap-hidden-control-probe",
+          event: "aggressive-loadVideoById-called",
           videoId,
-          visibleStartupControlCandidate,
-          visibleControlProbeResult,
-          visibleSnapshot,
+          resumeAt,
+          videoState: summarizeVideoElementState(),
         });
-      }
-
-      remember({
-        event: "direct-source-swap-hidden-probe-start",
-        videoId,
-        candidate: { ...candidate, mechanismTest },
-        candidateIdentity,
-        videoState: summarizeVideoElementState(),
-      });
-
-      const hiddenProbeResult = await probeDirectCandidateInHiddenVideo(videoId, candidate);
-
-      if (!hiddenProbeResult.ok) {
+      } catch (err) {
         remember({
-          event: "direct-source-swap-not-viable",
-          reason: "hidden-candidate-probe-failed",
+          event: "aggressive-loadVideoById-failed",
           videoId,
-          candidate: { ...candidate, mechanismTest },
-          probeResult: hiddenProbeResult,
-          visibleControlProbeResult,
+          resumeAt,
+          error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
           videoState: summarizeVideoElementState(),
         });
 
-        return { attempted: false, ok: false, reason: "hidden-candidate-probe-failed" };
-      }
+        handoffState.replay.armed = false;
 
+        return { attempted: true, ok: false, reason: "loadVideoById-failed" };
+      }
+    } else {
       remember({
-        event: "direct-source-swap-attempt",
+        event: "aggressive-handoff-failed",
+        reason: "no-loadVideoById",
         videoId,
-        from: before,
-        beforeIdentity,
-        candidate: { ...candidate, mechanismTest },
-        candidateIdentity,
-      });
-
-      const waitPromise = waitForVideoEventOrTimeout(v, [
-        "loadedmetadata",
-        "canplay",
-        "playing",
-        "error",
-      ], 4000);
-
-      v.src = candidate.url;
-
-      if (typeof v.load === "function") {
-        v.load();
-      }
-
-      try {
-        if (Number.isFinite(resumeAt) && resumeAt > 0) {
-          v.currentTime = resumeAt;
-        }
-      } catch {}
-
-      v.volume = oldVolume;
-      v.muted = oldMuted;
-      v.playbackRate = oldPlaybackRate;
-
-      let playError = "";
-
-      if (!wasPaused) {
-        try {
-          await v.play();
-        } catch (err) {
-          playError = `${err?.name || "Error"}: ${err?.message || String(err)}`;
-        }
-      }
-
-      const waitResult = await waitPromise;
-
-      const probes = [];
-
-      for (const delayMs of [0, 250, 1000, 2500]) {
-        if (delayMs) await delay(delayMs);
-
-        const snapshot = summarizeVideoElementStateWithIdentity();
-
-        probes.push({
-          delayMs,
-          state: snapshot.state,
-          identity: snapshot.identity,
-        });
-
-        remember({
-          event: "direct-source-swap-verify-probe",
-          videoId,
-          delayMs,
-          candidate: { ...candidate, mechanismTest },
-          candidateIdentity,
-          state: snapshot.state,
-          identity: snapshot.identity,
-        });
-      }
-
-      const finalProbe = probes[probes.length - 1];
-      const after = finalProbe.state;
-      const afterIdentity = finalProbe.identity;
-
-      const candidateIdMatches =
-        !!candidateIdentity.id &&
-        !!afterIdentity.id &&
-        afterIdentity.id === candidateIdentity.id;
-
-      const candidateHostPathItagMatches =
-        !!candidateIdentity.host &&
-        !!afterIdentity.host &&
-        afterIdentity.host === candidateIdentity.host &&
-        afterIdentity.path === candidateIdentity.path &&
-        afterIdentity.itag === candidateIdentity.itag;
-
-      const beforeIdMatches =
-        !!beforeIdentity.id &&
-        !!afterIdentity.id &&
-        afterIdentity.id === beforeIdentity.id;
-
-      const beforeHostPathItagMatches =
-        !!beforeIdentity.host &&
-        !!afterIdentity.host &&
-        afterIdentity.host === beforeIdentity.host &&
-        afterIdentity.path === beforeIdentity.path &&
-        afterIdentity.itag === beforeIdentity.itag;
-
-      const srcLooksCorrect =
-        /googlevideo\.com\/videoplayback/i.test(after.currentSrc || "") &&
-        afterIdentity.itag === candidateIdentity.itag &&
-        !afterIdentity.hasSabr &&
-        (candidateIdMatches || candidateHostPathItagMatches);
-
-      const revertedToStartupSource =
-        !srcLooksCorrect &&
-        /googlevideo\.com\/videoplayback/i.test(after.currentSrc || "") &&
-        (beforeIdMatches || beforeHostPathItagMatches);
-
-      const noError = !after.error;
-      const readyOk = Number(after.readyState || 0) >= 2;
-      const timeOk = Math.abs(Number(after.currentTime || 0) - resumeAt) < 2;
-      const playingOk = wasPaused || !after.paused;
-
-      let verifyReason = "";
-
-      if (!srcLooksCorrect && revertedToStartupSource) {
-        verifyReason = "source-reverted-to-startup";
-      } else if (!srcLooksCorrect) {
-        verifyReason = "src-mismatch";
-      } else if (!noError) {
-        verifyReason = "video-error";
-      } else if (!readyOk) {
-        verifyReason = "readyState-low";
-      } else if (!timeOk) {
-        verifyReason = "time-reset";
-      } else if (!playingOk) {
-        verifyReason = "playback-stopped";
-      }
-
-      if (verifyReason) {
-        remember({
-          event: "direct-source-swap-verify-failed",
-          videoId,
-          reason: verifyReason,
-          candidate: { ...candidate, mechanismTest },
-          candidateIdentity,
-          candidateIdMatches,
-          candidateHostPathItagMatches,
-          before,
-          beforeIdentity,
-          after,
-          afterIdentity,
-          beforeIdMatches,
-          beforeHostPathItagMatches,
-          srcLooksCorrect,
-          revertedToStartupSource,
-          waitResult,
-          playError: playError || null,
-          probes,
-        });
-
-        return { attempted: true, ok: false, reason: verifyReason };
-      }
-
-      remember({
-        event: "direct-source-swap-success",
-        videoId,
-        from: before,
-        beforeIdentity,
-        to: after,
-        afterIdentity,
-        candidate: { ...candidate, mechanismTest },
-        candidateIdentity,
-        candidateIdMatches,
-        candidateHostPathItagMatches,
-        beforeIdMatches,
-        beforeHostPathItagMatches,
-        srcLooksCorrect,
-        waitResult,
-        playError: playError || null,
-        probes,
-      });
-
-      return { attempted: true, ok: true };
-    } catch (err) {
-      remember({
-        event: "direct-source-swap-failed",
-        videoId,
-        error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
-        candidate,
         videoState: summarizeVideoElementState(),
       });
 
-      return { attempted: true, ok: false, error: `${err?.name || "Error"}: ${err?.message || String(err)}` };
+      handoffState.replay.armed = false;
+
+      return { attempted: true, ok: false, reason: "no-loadVideoById" };
     }
+
+    const probeDelays = [250, 750, 1500, 3000, 6000];
+
+    for (const delayMs of probeDelays) {
+      await delay(delayMs - (probeDelays.indexOf(delayMs) ? probeDelays[probeDelays.indexOf(delayMs) - 1] : 0));
+
+      remember({
+        event: "aggressive-handoff-probe",
+        videoId,
+        delayMs,
+        replayState: {
+          armed: handoffState.replay.armed,
+          playerHits: handoffState.replay.playerHits,
+          nextHits: handoffState.replay.nextHits,
+        },
+        videoState: summarizeVideoElementState(),
+      });
+    }
+
+    remember({
+      event: "aggressive-handoff-complete",
+      videoId,
+      replayState: {
+        playerHits: handoffState.replay.playerHits,
+        nextHits: handoffState.replay.nextHits,
+      },
+      videoState: summarizeVideoElementState(),
+    });
+
+    return {
+      attempted: true,
+      ok: true,
+      reason: "aggressive-warm-replay-handoff-tested",
+    };
   }
 
   function scheduleBackgroundWarmupReadyCheck(videoId) {
     if (!isHybridStartupMode()) return;
     if (!videoId) return;
-    if (hybridState.handoffInProgress) return;
+    if (handoffState.inProgress) return;
 
-    clearHybridHandoffTimer();
+    clearHandoffTimer();
 
-    hybridState.activePatchVideoId = videoId;
+    handoffState.activePatchVideoId = videoId;
 
     remember({
       event: "background-warmup-ready-check-scheduled",
@@ -2063,7 +1642,7 @@ yt-source-swap-test.js text/javascript
       effectiveVideoId: getCurrentEffectiveVideoId(),
     });
 
-    hybridState.pendingHandoffTimer = setInterval(async () => {
+    handoffState.pendingTimer = setInterval(async () => {
       const v = document.querySelector("video");
       const pageVideoId = getCurrentPageVideoId();
       const urlVideoId = getCurrentUrlVideoId();
@@ -2072,7 +1651,7 @@ yt-source-swap-test.js text/javascript
       if (!v) return;
 
       if (effectiveVideoId && effectiveVideoId !== videoId) {
-        clearHybridHandoffTimer();
+        clearHandoffTimer();
         remember({
           event: "hybrid-handoff-cancelled",
           reason: "video-changed",
@@ -2085,7 +1664,7 @@ yt-source-swap-test.js text/javascript
       }
 
       if (v.error) {
-        clearHybridHandoffTimer();
+        clearHandoffTimer();
         remember({
           event: "hybrid-handoff-cancelled",
           reason: "video-error-before-handoff",
@@ -2103,7 +1682,7 @@ yt-source-swap-test.js text/javascript
         return;
       }
 
-      const warmup = hybridWarmupState.byVideoId.get(videoId);
+      const warmup = handoffState.warmupByVideoId.get(videoId);
       const warmupAgeMs = warmup
         ? Math.round(performance.now() - warmup.startedAt)
         : 0;
@@ -2127,7 +1706,7 @@ yt-source-swap-test.js text/javascript
           return;
         }
 
-        clearHybridHandoffTimer();
+        clearHandoffTimer();
 
         remember({
           event: "hybrid-handoff-cancelled",
@@ -2142,7 +1721,7 @@ yt-source-swap-test.js text/javascript
       }
 
       if (!warmup.ok) {
-        clearHybridHandoffTimer();
+        clearHandoffTimer();
 
         remember({
           event: "hybrid-handoff-cancelled",
@@ -2165,9 +1744,9 @@ yt-source-swap-test.js text/javascript
         warmupResults: warmup.results,
       });
 
-      clearHybridHandoffTimer();
+      clearHandoffTimer();
 
-      hybridState.handoffInProgress = false;
+      handoffState.inProgress = false;
 
       remember({
         event: "web-warmup-ready",
@@ -2176,7 +1755,7 @@ yt-source-swap-test.js text/javascript
         videoState: summarizeVideoElementState(),
       });
 
-      const swapResult = await attemptDirectWarmSourceSwap(videoId, warmup);
+      const swapResult = await attemptAggressiveWarmReplayHandoff(videoId, warmup);
 
       if (swapResult.attempted && swapResult.ok) {
         remember({
@@ -2935,6 +2514,64 @@ yt-source-swap-test.js text/javascript
 
       meta = await readFetchMeta(input, init);
 
+      if (
+        handoffState.replay.armed &&
+        performance.now() < handoffState.replay.expiresAt
+      ) {
+        const endpoint = meta.endpoint || endpointForUrl(meta.url);
+        const requestVideoId = getBodyVideoId(meta.bodyJson);
+
+        if (
+          requestVideoId === handoffState.replay.videoId &&
+          endpoint === "player" &&
+          handoffState.replay.playerJson
+        ) {
+          handoffState.replay.playerHits++;
+
+          remember({
+            event: "aggressive-replay-hit",
+            endpoint: "player",
+            transport: meta.transport,
+            videoId: handoffState.replay.videoId,
+            ageMs: Math.round(performance.now() - handoffState.replay.startedAt),
+          });
+
+          return new Response(JSON.stringify(handoffState.replay.playerJson), {
+            status: 200,
+            statusText: "OK",
+            headers: {
+              "content-type": "application/json; charset=utf-8",
+              "x-yt-source-swap-aggressive-replay": "player",
+            },
+          });
+        }
+
+        if (
+          requestVideoId === handoffState.replay.videoId &&
+          endpoint === "next" &&
+          handoffState.replay.nextJson
+        ) {
+          handoffState.replay.nextHits++;
+
+          remember({
+            event: "aggressive-replay-hit",
+            endpoint: "next",
+            transport: meta.transport,
+            videoId: handoffState.replay.videoId,
+            ageMs: Math.round(performance.now() - handoffState.replay.startedAt),
+          });
+
+          return new Response(JSON.stringify(handoffState.replay.nextJson), {
+            status: 200,
+            statusText: "OK",
+            headers: {
+              "content-type": "application/json; charset=utf-8",
+              "x-yt-source-swap-aggressive-replay": "next",
+            },
+          });
+        }
+      }
+
       counters.seen++;
       counters.seenFetch++;
       counters.lastTransport = "fetch";
@@ -3189,9 +2826,9 @@ yt-source-swap-test.js text/javascript
     lastObservedVideoId = current;
 
     if (previous && current !== previous) {
-      clearHybridHandoffTimer();
-      hybridState.handoffInProgress = false;
-      hybridState.activeVideoId = current;
+      clearHandoffTimer();
+      handoffState.inProgress = false;
+      handoffState.activeVideoId = current;
 
       remember({
         event: "hybrid-video-change",
@@ -3236,19 +2873,22 @@ yt-source-swap-test.js text/javascript
         requestVideoId: "",
       };
 
-      clearHybridHandoffTimer();
-      hybridState.handoffInProgress = false;
-      hybridState.activeVideoId = "";
-      hybridState.activePatchVideoId = "";
-      hybridWarmupState.byVideoId.clear();
+      clearHandoffTimer();
+      handoffState.inProgress = false;
+      handoffState.activeVideoId = "";
+      handoffState.activePatchVideoId = "";
+      handoffState.warmupByVideoId.clear();
+      handoffState.replay.armed = false;
+      handoffState.replay.playerJson = null;
+      handoffState.replay.nextJson = null;
     },
 
     clearHybridMemory() {
-      hybridState.handoffAttemptedByVideoId.clear();
-      hybridState.handoffInProgress = false;
-      clearHybridHandoffTimer();
+      handoffState.attemptedByVideoId.clear();
+      handoffState.inProgress = false;
+      clearHandoffTimer();
       clearPersistedHybridHandoff();
-      hybridWarmupState.byVideoId.clear();
+      handoffState.warmupByVideoId.clear();
       console.log("[yt-source-swap] cleared hybrid handoff memory");
     },
 
@@ -3263,9 +2903,9 @@ yt-source-swap-test.js text/javascript
         urlVideoId,
         effectiveVideoId,
         config: cloneJson(config.hybridStartup),
-        handoffInProgress: hybridState.handoffInProgress,
-        activeVideoId: hybridState.activeVideoId,
-        activePatchVideoId: hybridState.activePatchVideoId,
+        handoffInProgress: handoffState.inProgress,
+        activeVideoId: handoffState.activeVideoId,
+        activePatchVideoId: handoffState.activePatchVideoId,
         persisted,
         persistedApplies: !!getActivePersistedHybridBypass(effectiveVideoId),
       };
