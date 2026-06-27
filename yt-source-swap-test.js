@@ -1349,7 +1349,11 @@ yt-source-swap-test.js text/javascript
     const persisted = getActivePersistedHybridBypass(videoId);
     if (persisted) return true;
 
-    const last = hybridState.handoffAttemptedByVideoId.get(videoId) || 0;
+    if (!hybridState.handoffAttemptedByVideoId.has(videoId)) {
+      return false;
+    }
+
+    const last = hybridState.handoffAttemptedByVideoId.get(videoId);
     const age = performance.now() - last;
 
     return age >= 0 && age < Number(config.hybridStartup.handoffCooldownMs || 30000);
@@ -1470,7 +1474,6 @@ yt-source-swap-test.js text/javascript
     if (!isHybridStartupMode()) return;
     if (!videoId) return;
     if (hybridState.handoffInProgress) return;
-    if (hasHybridHandoffRecently(videoId)) return;
 
     clearHybridHandoffTimer();
 
