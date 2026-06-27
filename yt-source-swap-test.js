@@ -1470,30 +1470,28 @@ yt-source-swap-test.js text/javascript
     return record;
   }
 
-  function summarizeVideoElementStateWithIdentity() {
-    const v = document.querySelector("video");
-
-    if (!v) {
+  function summarizeSpecificVideoElementStateWithIdentity(video) {
+    if (!video) {
       return {
         state: { hasVideo: false },
         identity: summarizeSourceIdentity(""),
       };
     }
 
-    const currentSrc = String(v.currentSrc || "");
+    const currentSrc = String(video.currentSrc || "");
 
     const state = {
       hasVideo: true,
       currentSrc,
-      readyState: v.readyState,
-      networkState: v.networkState,
-      paused: v.paused,
-      currentTime: v.currentTime,
-      duration: v.duration,
-      error: v.error
+      readyState: video.readyState,
+      networkState: video.networkState,
+      paused: video.paused,
+      currentTime: video.currentTime,
+      duration: video.duration,
+      error: video.error
         ? {
-            code: v.error.code,
-            message: v.error.message,
+            code: video.error.code,
+            message: video.error.message,
           }
         : null,
     };
@@ -1502,6 +1500,10 @@ yt-source-swap-test.js text/javascript
       state,
       identity: summarizeSourceIdentity(currentSrc),
     };
+  }
+
+  function summarizeVideoElementStateWithIdentity() {
+    return summarizeSpecificVideoElementStateWithIdentity(document.querySelector("video"));
   }
 
   function delay(ms) {
@@ -1568,6 +1570,106 @@ yt-source-swap-test.js text/javascript
         hasSabr: false,
       };
     }
+  }
+
+  async function probeDirectCandidateInHiddenVideo(videoId, candidate, timeoutMs = 5000) {
+    const candidateIdentity = summarizeSourceIdentity(candidate.url);
+
+    const hidden = document.createElement("video");
+    hidden.muted = true;
+    hidden.playsInline = true;
+    hidden.preload = "auto";
+    hidden.style.position = "fixed";
+    hidden.style.left = "-99999px";
+    hidden.style.top = "-99999px";
+    hidden.style.width = "1px";
+    hidden.style.height = "1px";
+    hidden.style.opacity = "0";
+    hidden.style.pointerEvents = "none";
+    hidden.setAttribute("aria-hidden", "true");
+
+    document.documentElement.appendChild(hidden);
+
+    const waitPromise = waitForVideoEventOrTimeout(hidden, [
+      "loadedmetadata",
+      "canplay",
+      "playing",
+      "error",
+    ], timeoutMs);
+
+    hidden.src = candidate.url;
+
+    if (typeof hidden.load === "function") {
+      hidden.load();
+    }
+
+    const waitResult = await waitPromise;
+
+    const afterSnapshot = summarizeSpecificVideoElementStateWithIdentity(hidden);
+    const state = afterSnapshot.state;
+    const identity = afterSnapshot.identity;
+
+    const idMatches =
+      !!candidateIdentity.id &&
+      !!identity.id &&
+      identity.id === candidateIdentity.id;
+
+    const hostPathItagMatches =
+      !!candidateIdentity.host &&
+      !!identity.host &&
+      identity.host === candidateIdentity.host &&
+      identity.path === candidateIdentity.path &&
+      identity.itag === candidateIdentity.itag;
+
+    const srcLooksCorrect =
+      /googlevideo\.com\/videoplayback/i.test(state.currentSrc || "") &&
+      identity.itag === candidateIdentity.itag &&
+      !identity.hasSabr &&
+      (idMatches || hostPathItagMatches);
+
+    const noError = !state.error;
+    const readyOk = Number(state.readyState || 0) >= 1;
+
+    let reason = "";
+    if (!srcLooksCorrect) reason = "src-mismatch";
+    else if (!noError) reason = `video-error-${state.error?.code || "?"}`;
+    else if (!readyOk) reason = "readyState-low";
+
+    const ok = !reason;
+
+    try {
+      hidden.pause();
+      hidden.removeAttribute("src");
+      if (typeof hidden.load === "function") {
+        hidden.load();
+      }
+    } catch {}
+
+    if (hidden.parentNode) {
+      hidden.parentNode.removeChild(hidden);
+    }
+
+    const result = {
+      ok,
+      reason: reason || "ok",
+      candidateIdentity,
+      state,
+      identity,
+      waitResult: waitResult.event,
+      idMatches,
+      hostPathItagMatches,
+      srcLooksCorrect,
+    };
+
+    remember({
+      event: "direct-source-swap-hidden-probe",
+      videoId,
+      candidate,
+      candidateIdentity,
+      ...result,
+    });
+
+    return result;
   }
 
   async function attemptDirectWarmSourceSwap(videoId, warmup) {
@@ -1693,6 +1795,29 @@ yt-source-swap-test.js text/javascript
       const oldVolume = v.volume;
       const oldMuted = v.muted;
       const oldPlaybackRate = v.playbackRate;
+
+      remember({
+        event: "direct-source-swap-hidden-probe-start",
+        videoId,
+        candidate: { ...candidate, mechanismTest },
+        candidateIdentity,
+        videoState: summarizeVideoElementState(),
+      });
+
+      const hiddenProbeResult = await probeDirectCandidateInHiddenVideo(videoId, candidate);
+
+      if (!hiddenProbeResult.ok) {
+        remember({
+          event: "direct-source-swap-not-viable",
+          reason: "hidden-candidate-probe-failed",
+          videoId,
+          candidate: { ...candidate, mechanismTest },
+          probeResult: hiddenProbeResult,
+          videoState: summarizeVideoElementState(),
+        });
+
+        return { attempted: false, ok: false, reason: "hidden-candidate-probe-failed" };
+      }
 
       remember({
         event: "direct-source-swap-attempt",
