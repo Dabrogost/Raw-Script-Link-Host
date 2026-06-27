@@ -2519,10 +2519,16 @@ yt-source-swap-test.js text/javascript
         performance.now() < handoffState.replay.expiresAt
       ) {
         const endpoint = meta.endpoint || endpointForUrl(meta.url);
-        const requestVideoId = getBodyVideoId(meta.bodyJson);
+        const requestVideoId =
+          getBodyVideoId(meta.bodyJson) ||
+          getCurrentEffectiveVideoId();
+
+        const videoMatches =
+          !requestVideoId ||
+          requestVideoId === handoffState.replay.videoId;
 
         if (
-          requestVideoId === handoffState.replay.videoId &&
+          videoMatches &&
           endpoint === "player" &&
           handoffState.replay.playerJson
         ) {
@@ -2547,7 +2553,7 @@ yt-source-swap-test.js text/javascript
         }
 
         if (
-          requestVideoId === handoffState.replay.videoId &&
+          videoMatches &&
           endpoint === "next" &&
           handoffState.replay.nextJson
         ) {
@@ -2568,6 +2574,23 @@ yt-source-swap-test.js text/javascript
               "content-type": "application/json; charset=utf-8",
               "x-yt-source-swap-aggressive-replay": "next",
             },
+          });
+        }
+
+        if (endpoint === "player" || endpoint === "next") {
+          remember({
+            event: "aggressive-replay-miss",
+            endpoint,
+            transport: meta.transport,
+            requestVideoId,
+            expectedVideoId: handoffState.replay.videoId,
+            videoMatches,
+            hasPlayerJson: !!handoffState.replay.playerJson,
+            hasNextJson: !!handoffState.replay.nextJson,
+            url: meta.url,
+            bodyTopKeys: meta.bodyJson ? Object.keys(meta.bodyJson).slice(0, 30) : [],
+            currentEffectiveVideoId: getCurrentEffectiveVideoId(),
+            ageMs: Math.round(performance.now() - handoffState.replay.startedAt),
           });
         }
       }
