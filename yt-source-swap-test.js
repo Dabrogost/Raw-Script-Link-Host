@@ -110,7 +110,8 @@ yt-source-swap-test.js text/javascript
       bridgeMaxMs: 16000,
       bridgeRevealSyncMs: 700,
       bridgeRevealMaxDriftSeconds: 0.75,
-      visibleReloadProbeDelays: [250, 750, 1500, 3000, 6000, 9000, 12000],
+      bridgeZIndex: 30,
+      visibleReloadProbeDelays: [250, 750, 1500, 3000, 4000, 5000, 6000, 9000, 12000],
     },
     endpoints: {
       player: false,
@@ -1952,7 +1953,7 @@ yt-source-swap-test.js text/javascript
     const desiredTime = Math.max(0, Number(resumeAt || visible.currentTime || 0));
 
     container.setAttribute("data-yt-source-swap-bridge-video", "1");
-    container.style.zIndex = "2147483647";
+    container.style.zIndex = String(config.hiddenWarmup?.bridgeZIndex || 30);
     container.style.opacity = "0";
     container.style.pointerEvents = "none";
     container.style.overflow = "hidden";
