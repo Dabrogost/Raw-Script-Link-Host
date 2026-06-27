@@ -355,9 +355,9 @@ yt-source-swap-test.js text/javascript
             videoId,
             currentVideoId,
             error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
-            videoState: summarizeVideoElementState(),
-          });
-        }
+        videoState: summarizeVideoElementState(),
+      });
+    }
       }, delayMs);
     }
   }
@@ -1484,6 +1484,153 @@ yt-source-swap-test.js text/javascript
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
+  function stabilizeAggressiveBlobPlayback(videoId, resumeAt, reason = "aggressive-post-blob") {
+    const player = getMoviePlayer();
+    const v = document.querySelector("video");
+    const currentVideoId = getCurrentEffectiveVideoId();
+
+    if (videoId && currentVideoId && currentVideoId !== videoId) {
+      remember({
+        event: "aggressive-blob-stabilize-skipped",
+        reason: "video-changed",
+        videoId,
+        currentVideoId,
+        resumeAt,
+        videoState: summarizeVideoElementState(),
+      });
+      return;
+    }
+
+    if (!v) {
+      remember({
+        event: "aggressive-blob-stabilize-skipped",
+        reason: "no-video",
+        videoId,
+        resumeAt,
+      });
+      return;
+    }
+
+    const src = String(v.currentSrc || "");
+    const isBlob = src.startsWith("blob:");
+
+    remember({
+      event: "aggressive-blob-stabilize-check",
+      reason,
+      videoId,
+      currentVideoId,
+      resumeAt,
+      isBlob,
+      videoState: summarizeVideoElementState(),
+    });
+
+    if (!isBlob) return;
+    if (v.error) return;
+
+    const currentTime = Number(v.currentTime || 0);
+    const desired = Math.max(0, Number(resumeAt || 0));
+
+    if (desired > 1 && currentTime < Math.max(0.25, desired - 1)) {
+      try {
+        if (player && typeof player.seekTo === "function") {
+          player.seekTo(desired, true);
+        } else {
+          v.currentTime = desired;
+        }
+
+        remember({
+          event: "aggressive-blob-resume-seek",
+          reason,
+          videoId,
+          from: currentTime,
+          to: desired,
+          videoState: summarizeVideoElementState(),
+        });
+      } catch (err) {
+        remember({
+          event: "aggressive-blob-resume-seek-failed",
+          reason,
+          videoId,
+          from: currentTime,
+          to: desired,
+          error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
+          videoState: summarizeVideoElementState(),
+        });
+      }
+    }
+
+    if (v.paused && player && typeof player.playVideo === "function") {
+      try {
+        player.playVideo();
+
+        remember({
+          event: "aggressive-blob-play-attempt",
+          reason,
+          videoId,
+          videoState: summarizeVideoElementState(),
+        });
+      } catch (err) {
+        remember({
+          event: "aggressive-blob-play-failed",
+          reason,
+          videoId,
+          error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
+          videoState: summarizeVideoElementState(),
+        });
+      }
+    }
+  }
+
+  function evaluateAggressiveHandoffSuccess(videoId, resumeAt) {
+    const v = document.querySelector("video");
+    const state = summarizeVideoElementState();
+    const src = String(v?.currentSrc || "");
+    const isBlob = src.startsWith("blob:");
+    const hasError = !!v?.error;
+    const readyState = Number(v?.readyState || 0);
+    const currentTime = Number(v?.currentTime || 0);
+    const paused = !!v?.paused;
+    const desired = Math.max(0, Number(resumeAt || 0));
+
+    const timeOk =
+      desired <= 1 ||
+      currentTime >= desired - 1 ||
+      currentTime > 0;
+
+    const ok =
+      !!v &&
+      isBlob &&
+      !hasError &&
+      readyState >= 2 &&
+      timeOk &&
+      !paused;
+
+    return {
+      ok,
+      reason: ok
+        ? "blob-playing"
+        : !v
+          ? "no-video"
+          : !isBlob
+            ? "not-blob"
+            : hasError
+              ? "video-error"
+              : readyState < 2
+                ? "readyState-low"
+                : !timeOk
+                  ? "resume-time-not-restored"
+                  : paused
+                    ? "paused"
+                    : "unknown",
+      videoState: state,
+      replayState: {
+        armed: handoffState.replay.armed,
+        playerHits: handoffState.replay.playerHits,
+        nextHits: handoffState.replay.nextHits,
+      },
+    };
+  }
+
   async function attemptAggressiveWarmReplayHandoff(videoId, warmup) {
     const effectiveId = getCurrentEffectiveVideoId();
     if (effectiveId && effectiveId !== videoId) {
@@ -1522,7 +1669,7 @@ yt-source-swap-test.js text/javascript
 
     handoffState.replay.armed = true;
     handoffState.replay.videoId = videoId;
-    handoffState.replay.expiresAt = performance.now() + 8000;
+    handoffState.replay.expiresAt = performance.now() + 10000;
     handoffState.replay.playerJson = playerJson;
     handoffState.replay.nextJson = nextWarmup?.json ? cloneJson(nextWarmup.json) : null;
     handoffState.replay.playerHits = 0;
@@ -1605,22 +1752,38 @@ yt-source-swap-test.js text/javascript
         },
         videoState: summarizeVideoElementState(),
       });
+
+      stabilizeAggressiveBlobPlayback(videoId, resumeAt, `probe-${delayMs}`);
+    }
+
+    const result = evaluateAggressiveHandoffSuccess(videoId, resumeAt);
+
+    if (result.ok) {
+      remember({
+        event: "aggressive-handoff-success",
+        videoId,
+        resumeAt,
+        result,
+      });
+
+      return {
+        attempted: true,
+        ok: true,
+        reason: "aggressive-blob-handoff-success",
+      };
     }
 
     remember({
-      event: "aggressive-handoff-complete",
+      event: "aggressive-handoff-stalled",
       videoId,
-      replayState: {
-        playerHits: handoffState.replay.playerHits,
-        nextHits: handoffState.replay.nextHits,
-      },
-      videoState: summarizeVideoElementState(),
+      resumeAt,
+      result,
     });
 
     return {
       attempted: true,
-      ok: true,
-      reason: "aggressive-warm-replay-handoff-tested",
+      ok: false,
+      reason: result.reason || "aggressive-blob-handoff-stalled",
     };
   }
 
@@ -2469,6 +2632,63 @@ yt-source-swap-test.js text/javascript
     };
   }
 
+  function checkAndDisarmReplay() {
+    if (!handoffState.replay.armed) return false;
+
+    const v = document.querySelector("video");
+    const src = String(v?.currentSrc || "");
+
+    if (src.startsWith("blob:")) {
+      handoffState.replay.armed = false;
+
+      remember({
+        event: "aggressive-replay-disarmed-on-blob",
+        videoId: handoffState.replay.videoId,
+        playerHits: handoffState.replay.playerHits,
+        nextHits: handoffState.replay.nextHits,
+        ageMs: Math.round(performance.now() - handoffState.replay.startedAt),
+        videoState: summarizeVideoElementState(),
+      });
+
+      return false;
+    }
+
+    if (
+      handoffState.replay.playerHits > 0 &&
+      handoffState.replay.nextHits > 0
+    ) {
+      handoffState.replay.armed = false;
+
+      remember({
+        event: "aggressive-replay-fulfilled",
+        videoId: handoffState.replay.videoId,
+        playerHits: handoffState.replay.playerHits,
+        nextHits: handoffState.replay.nextHits,
+        ageMs: Math.round(performance.now() - handoffState.replay.startedAt),
+        videoState: summarizeVideoElementState(),
+      });
+
+      return false;
+    }
+
+    if (performance.now() >= handoffState.replay.expiresAt) {
+      handoffState.replay.armed = false;
+
+      remember({
+        event: "aggressive-replay-expired",
+        videoId: handoffState.replay.videoId,
+        playerHits: handoffState.replay.playerHits,
+        nextHits: handoffState.replay.nextHits,
+        ageMs: Math.round(performance.now() - handoffState.replay.startedAt),
+        videoState: summarizeVideoElementState(),
+      });
+
+      return false;
+    }
+
+    return true;
+  }
+
   async function sourceSwapFetch(input, init) {
     let meta = null;
 
@@ -2514,10 +2734,7 @@ yt-source-swap-test.js text/javascript
 
       meta = await readFetchMeta(input, init);
 
-      if (
-        handoffState.replay.armed &&
-        performance.now() < handoffState.replay.expiresAt
-      ) {
+      if (checkAndDisarmReplay()) {
         const endpoint = meta.endpoint || endpointForUrl(meta.url);
         const requestVideoId =
           getBodyVideoId(meta.bodyJson) ||
@@ -2764,10 +2981,7 @@ yt-source-swap-test.js text/javascript
         counters.lastTransport = "xhr";
         counters.lastEndpoint = meta.endpoint || "";
 
-        if (
-          handoffState.replay.armed &&
-          performance.now() < handoffState.replay.expiresAt
-        ) {
+        if (checkAndDisarmReplay()) {
           const endpoint = meta.endpoint || endpointForUrl(meta.url);
           const requestVideoId =
             getBodyVideoId(meta.bodyJson) ||
