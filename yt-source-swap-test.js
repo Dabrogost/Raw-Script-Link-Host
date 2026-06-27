@@ -101,9 +101,14 @@ yt-source-swap-test.js text/javascript
       quality: "hd720",
       keepOverlayAfterTransition: true,
       presentationMode: "visible-reload",
-      visiblePreload: true,
+      visiblePreload: false,
       visiblePreloadLeadMs: 1200,
       visiblePreloadVariantGapMs: 250,
+      bridgeDuringVisibleReload: true,
+      bridgeReadyTimeoutMs: 900,
+      bridgeFadeMs: 160,
+      bridgeMaxMs: 16000,
+      visibleReloadProbeDelays: [250, 750, 1500, 3000, 6000, 9000, 12000],
     },
     endpoints: {
       player: false,
@@ -203,6 +208,18 @@ yt-source-swap-test.js text/javascript
     visibleReloadStarted: false,
   };
 
+  const bridgeState = {
+    container: null,
+    video: null,
+    timer: null,
+    videoId: "",
+    source: "",
+    startedAt: 0,
+    resumeAt: 0,
+    ready: false,
+    clearing: false,
+  };
+
   function log(...args) {
     if (config.logVerbose) {
       console.log("%c[yt-source-swap]", "font-weight:bold;color:#2b7", ...args);
@@ -297,7 +314,7 @@ yt-source-swap-test.js text/javascript
   }
 
   function summarizeVideoElementState() {
-    const v = document.querySelector("video");
+    const v = getVisibleVideo();
 
     if (!v) {
       return {
@@ -332,7 +349,7 @@ yt-source-swap-test.js text/javascript
   }
 
   function isVisiblePatchedMweb360Source() {
-    const v = document.querySelector("video");
+    const v = getVisibleVideo();
     const src = String(v?.currentSrc || "");
 
     if (!v || !src) return false;
@@ -363,7 +380,7 @@ yt-source-swap-test.js text/javascript
         if (videoId && currentVideoId && currentVideoId !== videoId) return;
 
         const player = getMoviePlayer();
-        const v = document.querySelector("video");
+        const v = getVisibleVideo();
 
         const playerState =
           player && typeof player.getPlayerState === "function"
@@ -1679,7 +1696,11 @@ yt-source-swap-test.js text/javascript
   }
 
   function getVisibleVideo() {
-    return document.querySelector("video");
+    const videos = Array.from(document.querySelectorAll("video"));
+    return videos.find(v =>
+      !v.closest("[data-yt-source-swap-bridge-video]") &&
+      !v.closest("[data-yt-source-swap-hidden-warmup]")
+    ) || null;
   }
 
   function getVisiblePlayerBounds() {
@@ -1752,6 +1773,326 @@ yt-source-swap-test.js text/javascript
     hiddenWarmState.container.style.top = `${Math.round(rect.top)}px`;
     hiddenWarmState.container.style.width = `${Math.round(rect.width)}px`;
     hiddenWarmState.container.style.height = `${Math.round(rect.height)}px`;
+  }
+
+  function summarizeBridgeVideoState() {
+    const v = bridgeState.video;
+
+    if (!v) {
+      return {
+        hasBridge: false,
+      };
+    }
+
+    return {
+      hasBridge: true,
+      videoId: bridgeState.videoId,
+      ready: bridgeState.ready,
+      source: bridgeState.source,
+      sourceInfo: summarizeMediaUrl(bridgeState.source),
+      currentSrc: v.currentSrc || "",
+      readyState: v.readyState,
+      networkState: v.networkState,
+      paused: v.paused,
+      muted: v.muted,
+      volume: v.volume,
+      currentTime: v.currentTime,
+      duration: v.duration,
+      ageMs: Math.round(performance.now() - bridgeState.startedAt),
+      opacity: bridgeState.container?.style?.opacity || "",
+      error: v.error
+        ? {
+            code: v.error.code,
+            message: v.error.message,
+          }
+        : null,
+    };
+  }
+
+  function attachBridgeVideoOverlay(container) {
+    const host = getHiddenWarmupHost();
+
+    if (host && host !== document.documentElement) {
+      try {
+        if (container.parentNode !== host) {
+          host.appendChild(container);
+        }
+      } catch {}
+
+      const computed = getComputedStyle(host);
+      if (computed.position === "static") {
+        host.style.position = "relative";
+      }
+
+      container.style.position = "absolute";
+      container.style.left = "0";
+      container.style.top = "0";
+      container.style.right = "0";
+      container.style.bottom = "0";
+      container.style.width = "100%";
+      container.style.height = "100%";
+      return;
+    }
+
+    document.documentElement.appendChild(container);
+    container.style.position = "fixed";
+
+    const rect = getVisiblePlayerBounds();
+    if (!rect) {
+      container.style.inset = "0";
+      return;
+    }
+
+    container.style.left = `${Math.round(rect.left)}px`;
+    container.style.top = `${Math.round(rect.top)}px`;
+    container.style.width = `${Math.round(rect.width)}px`;
+    container.style.height = `${Math.round(rect.height)}px`;
+  }
+
+  function resetBridgeState() {
+    bridgeState.container = null;
+    bridgeState.video = null;
+    bridgeState.timer = null;
+    bridgeState.videoId = "";
+    bridgeState.source = "";
+    bridgeState.startedAt = 0;
+    bridgeState.resumeAt = 0;
+    bridgeState.ready = false;
+    bridgeState.clearing = false;
+  }
+
+  function clearBridgeVideo(reason = "clear", fade = false) {
+    const container = bridgeState.container;
+    const video = bridgeState.video;
+
+    if (!container && !video) return;
+
+    if (bridgeState.timer) {
+      clearTimeout(bridgeState.timer);
+      bridgeState.timer = null;
+    }
+
+    const previous = summarizeBridgeVideoState();
+
+    const finish = () => {
+      try {
+        video?.pause();
+      } catch {}
+
+      try {
+        if (video) {
+          video.removeAttribute("src");
+          video.load();
+        }
+      } catch {}
+
+      try {
+        container?.parentNode?.removeChild(container);
+      } catch {}
+
+      remember({
+        event: "bridge-video-cleared",
+        reason,
+        previous,
+      });
+
+      resetBridgeState();
+    };
+
+    const fadeMs = Math.max(0, Number(config.hiddenWarmup?.bridgeFadeMs || 160));
+
+    if (fade && container && fadeMs > 0 && !bridgeState.clearing) {
+      bridgeState.clearing = true;
+      container.style.transition = `opacity ${fadeMs}ms linear`;
+      container.style.opacity = "0";
+      setTimeout(finish, fadeMs + 50);
+      return;
+    }
+
+    finish();
+  }
+
+  async function prepareBridgeVideoForVisibleReload(videoId, resumeAt) {
+    if (!config.hiddenWarmup?.bridgeDuringVisibleReload) {
+      return { ok: false, reason: "bridge-disabled" };
+    }
+
+    const visible = getVisibleVideo();
+    const source = String(visible?.currentSrc || "");
+
+    if (!visible || !source) {
+      remember({
+        event: "bridge-video-skipped",
+        reason: !visible ? "no-visible-video" : "no-visible-source",
+        videoId,
+        videoState: summarizeVideoElementState(),
+      });
+
+      return { ok: false, reason: !visible ? "no-visible-video" : "no-visible-source" };
+    }
+
+    if (source.startsWith("blob:")) {
+      remember({
+        event: "bridge-video-skipped",
+        reason: "visible-already-blob",
+        videoId,
+        videoState: summarizeVideoElementState(),
+      });
+
+      return { ok: false, reason: "visible-already-blob" };
+    }
+
+    clearBridgeVideo("replace-before-visible-reload");
+
+    const container = document.createElement("div");
+    const video = document.createElement("video");
+    const timeoutMs = Math.max(100, Number(config.hiddenWarmup?.bridgeReadyTimeoutMs || 900));
+    const desiredTime = Math.max(0, Number(resumeAt || visible.currentTime || 0));
+
+    container.setAttribute("data-yt-source-swap-bridge-video", "1");
+    container.style.zIndex = "2147483647";
+    container.style.opacity = "0";
+    container.style.pointerEvents = "none";
+    container.style.overflow = "hidden";
+    container.style.background = "#000";
+
+    video.autoplay = true;
+    video.playsInline = true;
+    video.controls = false;
+    video.preload = "auto";
+    video.muted = !!visible.muted;
+    video.volume = Number.isFinite(visible.volume) ? visible.volume : 1;
+    video.playbackRate = Number.isFinite(visible.playbackRate) ? visible.playbackRate : 1;
+    video.style.width = "100%";
+    video.style.height = "100%";
+    video.style.display = "block";
+    video.style.objectFit = "contain";
+    video.style.background = "#000";
+
+    try {
+      video.disablePictureInPicture = true;
+    } catch {}
+
+    container.appendChild(video);
+    attachBridgeVideoOverlay(container);
+
+    bridgeState.container = container;
+    bridgeState.video = video;
+    bridgeState.videoId = videoId;
+    bridgeState.source = source;
+    bridgeState.startedAt = performance.now();
+    bridgeState.resumeAt = desiredTime;
+    bridgeState.ready = false;
+    bridgeState.clearing = false;
+    bridgeState.timer = setTimeout(() => {
+      clearBridgeVideo("bridge-max-ms-expired", true);
+    }, Math.max(1000, Number(config.hiddenWarmup?.bridgeMaxMs || 16000)));
+
+    remember({
+      event: "bridge-video-start",
+      videoId,
+      resumeAt: desiredTime,
+      sourceInfo: summarizeMediaUrl(source),
+      visibleState: summarizeVideoElementState(),
+    });
+
+    const seekBridge = () => {
+      try {
+        if (Number.isFinite(desiredTime) && desiredTime > 0) {
+          video.currentTime = desiredTime;
+        }
+      } catch {}
+    };
+
+    video.addEventListener("loadedmetadata", seekBridge, { once: true });
+    video.src = source;
+    seekBridge();
+
+    const tryPlay = () => {
+      try {
+        const p = video.play();
+        if (p && typeof p.catch === "function") {
+          p.catch(err => {
+            remember({
+              event: "bridge-video-play-failed",
+              videoId,
+              resumeAt: desiredTime,
+              error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
+              bridgeState: summarizeBridgeVideoState(),
+            });
+          });
+        }
+      } catch (err) {
+        remember({
+          event: "bridge-video-play-failed",
+          videoId,
+          resumeAt: desiredTime,
+          error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
+          bridgeState: summarizeBridgeVideoState(),
+        });
+      }
+    };
+
+    tryPlay();
+
+    const startedAt = performance.now();
+    while (performance.now() - startedAt < timeoutMs) {
+      if (video.error) {
+        remember({
+          event: "bridge-video-not-ready",
+          reason: "video-error",
+          videoId,
+          resumeAt: desiredTime,
+          bridgeState: summarizeBridgeVideoState(),
+        });
+
+        clearBridgeVideo("bridge-video-error");
+        return { ok: false, reason: "video-error" };
+      }
+
+      const bridgeTime = Number(video.currentTime || 0);
+      const bridgeTimeOk =
+        desiredTime <= 1 ||
+        bridgeTime >= desiredTime - 0.75 ||
+        Math.abs(bridgeTime - desiredTime) <= 1.25;
+
+      if (video.readyState >= 2 && !video.paused && bridgeTimeOk) {
+        bridgeState.ready = true;
+        container.style.opacity = "1";
+
+        remember({
+          event: "bridge-video-ready",
+          videoId,
+          resumeAt: desiredTime,
+          waitMs: Math.round(performance.now() - startedAt),
+          bridgeState: summarizeBridgeVideoState(),
+        });
+
+        return { ok: true, reason: "bridge-ready" };
+      }
+
+      if (video.readyState >= 1 && !bridgeTimeOk) {
+        seekBridge();
+      }
+
+      if (video.readyState >= 2 && video.paused) {
+        tryPlay();
+      }
+
+      await delay(50);
+    }
+
+    remember({
+      event: "bridge-video-not-ready",
+      reason: "timeout",
+      videoId,
+      resumeAt: desiredTime,
+      waitMs: Math.round(performance.now() - startedAt),
+      bridgeState: summarizeBridgeVideoState(),
+    });
+
+    clearBridgeVideo("bridge-ready-timeout");
+    return { ok: false, reason: "timeout" };
   }
 
   function getHiddenWarmDocument() {
@@ -2659,7 +3000,7 @@ yt-source-swap-test.js text/javascript
 
   function stabilizeAggressiveBlobPlayback(videoId, resumeAt, reason = "aggressive-post-blob") {
     const player = getMoviePlayer();
-    const v = document.querySelector("video");
+    const v = getVisibleVideo();
     const currentVideoId = getCurrentEffectiveVideoId();
 
     if (videoId && currentVideoId && currentVideoId !== videoId) {
@@ -2755,7 +3096,7 @@ yt-source-swap-test.js text/javascript
   }
 
   function evaluateAggressiveHandoffSuccess(videoId, resumeAt) {
-    const v = document.querySelector("video");
+    const v = getVisibleVideo();
     const state = summarizeVideoElementState();
     const src = String(v?.currentSrc || "");
     const isBlob = src.startsWith("blob:");
@@ -2843,7 +3184,7 @@ yt-source-swap-test.js text/javascript
     handoffState.replay.playerHits = 0;
     handoffState.replay.nextHits = 0;
     handoffState.replay.startedAt = performance.now();
-    handoffState.replay.resumeAt = Number(document.querySelector("video")?.currentTime || 0);
+    handoffState.replay.resumeAt = Number(getVisibleVideo()?.currentTime || 0);
 
     remember({
       event: `${reason}-armed`,
@@ -3029,11 +3370,13 @@ yt-source-swap-test.js text/javascript
 
     const player = getMoviePlayer();
     const resumeAt = armed.resumeAt;
+    const bridgeResult = await prepareBridgeVideoForVisibleReload(videoId, resumeAt);
 
     remember({
       event: "aggressive-handoff-start",
       videoId,
       resumeAt,
+      bridgeResult,
       gaplessReady: (() => {
         try {
           return player && typeof player.isGaplessTransitionReady === "function"
@@ -3058,7 +3401,9 @@ yt-source-swap-test.js text/javascript
           event: "aggressive-loadVideoById-called",
           videoId,
           resumeAt,
+          bridgeResult,
           videoState: summarizeVideoElementState(),
+          bridgeState: summarizeBridgeVideoState(),
         });
       } catch (err) {
         remember({
@@ -3067,9 +3412,11 @@ yt-source-swap-test.js text/javascript
           resumeAt,
           error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
           videoState: summarizeVideoElementState(),
+          bridgeState: summarizeBridgeVideoState(),
         });
 
         handoffState.replay.armed = false;
+        clearBridgeVideo("loadVideoById-failed", true);
 
         return { attempted: true, ok: false, reason: "loadVideoById-failed" };
       }
@@ -3079,17 +3426,23 @@ yt-source-swap-test.js text/javascript
         reason: "no-loadVideoById",
         videoId,
         videoState: summarizeVideoElementState(),
+        bridgeState: summarizeBridgeVideoState(),
       });
 
       handoffState.replay.armed = false;
+      clearBridgeVideo("no-loadVideoById", true);
 
       return { attempted: true, ok: false, reason: "no-loadVideoById" };
     }
 
-    const probeDelays = [250, 750, 1500, 3000, 6000];
+    const probeDelays = Array.isArray(config.hiddenWarmup?.visibleReloadProbeDelays)
+      ? config.hiddenWarmup.visibleReloadProbeDelays
+      : [250, 750, 1500, 3000, 6000, 9000, 12000];
+    let previousDelayMs = 0;
 
     for (const delayMs of probeDelays) {
-      await delay(delayMs - (probeDelays.indexOf(delayMs) ? probeDelays[probeDelays.indexOf(delayMs) - 1] : 0));
+      await delay(Math.max(0, Number(delayMs || 0) - previousDelayMs));
+      previousDelayMs = Number(delayMs || 0);
 
       remember({
         event: "aggressive-handoff-probe",
@@ -3101,6 +3454,7 @@ yt-source-swap-test.js text/javascript
           nextHits: handoffState.replay.nextHits,
         },
         videoState: summarizeVideoElementState(),
+        bridgeState: summarizeBridgeVideoState(),
       });
 
       stabilizeAggressiveBlobPlayback(videoId, resumeAt, `probe-${delayMs}`);
@@ -3114,7 +3468,10 @@ yt-source-swap-test.js text/javascript
         videoId,
         resumeAt,
         result,
+        bridgeState: summarizeBridgeVideoState(),
       });
+
+      clearBridgeVideo("visible-blob-ready", true);
 
       return {
         attempted: true,
@@ -3128,7 +3485,27 @@ yt-source-swap-test.js text/javascript
       videoId,
       resumeAt,
       result,
+      bridgeState: summarizeBridgeVideoState(),
     });
+
+    setTimeout(() => {
+      const late = evaluateAggressiveHandoffSuccess(videoId, resumeAt);
+
+      remember({
+        event: late.ok
+          ? "aggressive-handoff-late-success"
+          : "aggressive-handoff-late-still-stalled",
+        videoId,
+        resumeAt,
+        result: late,
+        bridgeState: summarizeBridgeVideoState(),
+      });
+
+      clearBridgeVideo(
+        late.ok ? "visible-blob-late-ready" : "visible-reload-stalled",
+        true
+      );
+    }, 3000);
 
     return {
       attempted: true,
@@ -3156,7 +3533,7 @@ yt-source-swap-test.js text/javascript
     });
 
     handoffState.pendingTimer = setInterval(async () => {
-      const v = document.querySelector("video");
+      const v = getVisibleVideo();
       const pageVideoId = getCurrentPageVideoId();
       const urlVideoId = getCurrentUrlVideoId();
       const effectiveVideoId = getCurrentEffectiveVideoId();
@@ -4018,7 +4395,7 @@ yt-source-swap-test.js text/javascript
   function checkAndDisarmReplay() {
     if (!handoffState.replay.armed) return false;
 
-    const v = document.querySelector("video");
+    const v = getVisibleVideo();
     const src = String(v?.currentSrc || "");
 
     if (src.startsWith("blob:")) {
@@ -4557,6 +4934,7 @@ yt-source-swap-test.js text/javascript
     if (previous && current !== previous) {
       clearHandoffTimer();
       clearHiddenWarmupState("video-changed");
+      clearBridgeVideo("video-changed", true);
       handoffState.inProgress = false;
       handoffState.activeVideoId = current;
 
@@ -4606,6 +4984,7 @@ yt-source-swap-test.js text/javascript
       clearHandoffTimer();
       clearHiddenWarmupState("clear");
       clearHiddenWarmReplay();
+      clearBridgeVideo("clear");
       handoffState.inProgress = false;
       handoffState.activeVideoId = "";
       handoffState.activePatchVideoId = "";
@@ -4622,6 +5001,7 @@ yt-source-swap-test.js text/javascript
       clearPersistedHybridHandoff();
       clearHiddenWarmupState("clear-hybrid-memory");
       clearHiddenWarmReplay();
+      clearBridgeVideo("clear-hybrid-memory");
       handoffState.warmupByVideoId.clear();
       console.log("[yt-source-swap] cleared hybrid handoff memory");
     },
@@ -4689,6 +5069,7 @@ yt-source-swap-test.js text/javascript
             : "",
         },
         frame: getHiddenWarmFrameDebug(),
+        bridgeState: summarizeBridgeVideoState(),
         visibleState: summarizeVideoElementState(),
         hiddenState: summarizeHiddenWarmVideoState(),
       };
@@ -4708,7 +5089,14 @@ yt-source-swap-test.js text/javascript
     clearHiddenWarmup() {
       clearHiddenWarmupState("manual-console");
       clearHiddenWarmReplay();
+      clearBridgeVideo("manual-console");
       console.log("[yt-source-swap] cleared hidden warmup");
+    },
+
+    bridgeStatus() {
+      const state = summarizeBridgeVideoState();
+      console.log("[yt-source-swap] bridgeStatus", state);
+      return state;
     },
 
     copyEvents() {
@@ -4730,6 +5118,7 @@ yt-source-swap-test.js text/javascript
     stop() {
       clearHandoffTimer();
       clearHiddenWarmupState("stop");
+      clearBridgeVideo("stop");
       g.fetch = nativeFetch;
       XMLHttpRequest.prototype.open = nativeOpen;
       XMLHttpRequest.prototype.send = nativeSend;
