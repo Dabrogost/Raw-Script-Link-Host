@@ -195,6 +195,7 @@ yt-source-swap-test.js text/javascript
     warmupSource: null,
     nudgeDone: false,
     lastProbeLogAt: 0,
+    transitionAudio: null,
   };
 
   function log(...args) {
@@ -2145,6 +2146,7 @@ yt-source-swap-test.js text/javascript
     hiddenWarmState.warmupSource = null;
     hiddenWarmState.nudgeDone = false;
     hiddenWarmState.lastProbeLogAt = 0;
+    hiddenWarmState.transitionAudio = null;
   }
 
   function buildHiddenWarmupEmbedUrl(videoId, startSeconds) {
@@ -2205,6 +2207,10 @@ yt-source-swap-test.js text/javascript
   }
 
   function syncHiddenWarmupToVisible(reason = "poll-sync") {
+    if (hiddenWarmState.transitioned && reason !== "transition") {
+      return null;
+    }
+
     const visible = getVisibleVideo();
     const hidden = getHiddenWarmVideo();
     const hiddenPlayer = getHiddenWarmMoviePlayer();
@@ -2256,10 +2262,15 @@ yt-source-swap-test.js text/javascript
   function driveHiddenWarmupPlayback(reason = "poll") {
     const hidden = getHiddenWarmVideo();
     const hiddenPlayer = getHiddenWarmMoviePlayer();
+    const warming = !hiddenWarmState.transitioned;
+    const transitionAudio = hiddenWarmState.transitionAudio || {};
 
     try {
       if (hidden) {
-        hidden.muted = true;
+        hidden.muted = warming ? true : !!transitionAudio.muted;
+        if (!warming && Number.isFinite(transitionAudio.volume)) {
+          hidden.volume = transitionAudio.volume;
+        }
         hidden.playsInline = true;
 
         if (hidden.paused && typeof hidden.play === "function") {
@@ -2275,13 +2286,33 @@ yt-source-swap-test.js text/javascript
       }
 
       if (hiddenPlayer) {
-        if (typeof hiddenPlayer.mute === "function") hiddenPlayer.mute();
+        if (warming && typeof hiddenPlayer.mute === "function") {
+          hiddenPlayer.mute();
+        } else if (!warming && transitionAudio.muted && typeof hiddenPlayer.mute === "function") {
+          hiddenPlayer.mute();
+        } else if (!warming && !transitionAudio.muted && typeof hiddenPlayer.unMute === "function") {
+          hiddenPlayer.unMute();
+        }
+
+        if (!warming && Number.isFinite(transitionAudio.volume) && typeof hiddenPlayer.setVolume === "function") {
+          hiddenPlayer.setVolume(Math.round(transitionAudio.volume * 100));
+        }
+
         if (typeof hiddenPlayer.playVideo === "function") hiddenPlayer.playVideo();
         if (typeof hiddenPlayer.setPlaybackQuality === "function") {
           hiddenPlayer.setPlaybackQuality(config.hiddenWarmup.quality || "hd720");
         }
       } else {
-        postHiddenWarmPlayerCommand("mute");
+        if (warming || transitionAudio.muted) {
+          postHiddenWarmPlayerCommand("mute");
+        } else {
+          postHiddenWarmPlayerCommand("unMute");
+        }
+
+        if (!warming && Number.isFinite(transitionAudio.volume)) {
+          postHiddenWarmPlayerCommand("setVolume", [Math.round(transitionAudio.volume * 100)]);
+        }
+
         postHiddenWarmPlayerCommand("playVideo");
         postHiddenWarmPlayerCommand("setPlaybackQuality", [config.hiddenWarmup.quality || "hd720"]);
       }
@@ -2347,25 +2378,40 @@ yt-source-swap-test.js text/javascript
     const hidden = getHiddenWarmVideo();
     const hiddenPlayer = getHiddenWarmMoviePlayer();
     const sync = syncHiddenWarmupToVisible("transition");
+    const transitionAudio = {
+      muted: !!visible?.muted,
+      volume: Number.isFinite(Number(visible?.volume)) ? Number(visible.volume) : 1,
+    };
 
     alignHiddenWarmupOverlay();
-    driveHiddenWarmupPlayback("transition");
 
     try {
+      hiddenWarmState.transitionAudio = transitionAudio;
+
       if (hidden) {
-        hidden.muted = false;
-        hidden.volume = visible ? visible.volume : 1;
+        hidden.muted = transitionAudio.muted;
+        hidden.volume = transitionAudio.volume;
       }
 
       if (hiddenPlayer) {
-        if (typeof hiddenPlayer.unMute === "function") hiddenPlayer.unMute();
+        if (transitionAudio.muted && typeof hiddenPlayer.mute === "function") {
+          hiddenPlayer.mute();
+        } else if (!transitionAudio.muted && typeof hiddenPlayer.unMute === "function") {
+          hiddenPlayer.unMute();
+        }
+
         if (typeof hiddenPlayer.setVolume === "function") {
-          hiddenPlayer.setVolume(Math.round(((visible?.volume ?? 1) || 1) * 100));
+          hiddenPlayer.setVolume(Math.round(transitionAudio.volume * 100));
         }
         if (typeof hiddenPlayer.playVideo === "function") hiddenPlayer.playVideo();
       } else {
-        postHiddenWarmPlayerCommand("unMute");
-        postHiddenWarmPlayerCommand("setVolume", [Math.round(((visible?.volume ?? 1) || 1) * 100)]);
+        if (transitionAudio.muted) {
+          postHiddenWarmPlayerCommand("mute");
+        } else {
+          postHiddenWarmPlayerCommand("unMute");
+        }
+
+        postHiddenWarmPlayerCommand("setVolume", [Math.round(transitionAudio.volume * 100)]);
         postHiddenWarmPlayerCommand("playVideo");
       }
     } catch (err) {
@@ -2395,11 +2441,14 @@ yt-source-swap-test.js text/javascript
     hiddenWarmState.transitioned = true;
     hiddenWarmState.ready = true;
 
+    driveHiddenWarmupPlayback("post-transition");
+
     remember({
       event: "hidden-warmup-transition",
       reason,
       videoId: hiddenWarmState.videoId,
       sync,
+      transitionAudio,
       visibleState: summarizeVideoElementState(),
       hiddenState: summarizeHiddenWarmVideoState(),
     });
@@ -2550,6 +2599,7 @@ yt-source-swap-test.js text/javascript
     hiddenWarmState.lastReason = "warming";
     hiddenWarmState.nudgeDone = false;
     hiddenWarmState.lastProbeLogAt = 0;
+    hiddenWarmState.transitionAudio = null;
     hiddenWarmState.warmupSource = {
       reason,
       playerSourceMode: replay.playerSourceMode || "",
@@ -4380,6 +4430,7 @@ yt-source-swap-test.js text/javascript
           lastReason: hiddenWarmState.lastReason,
           warmupSource: hiddenWarmState.warmupSource,
           nudgeDone: hiddenWarmState.nudgeDone,
+          transitionAudio: hiddenWarmState.transitionAudio,
           lastProbe: hiddenWarmState.lastProbe,
         },
         frame: getHiddenWarmFrameDebug(),
