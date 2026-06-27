@@ -2577,22 +2577,18 @@ yt-source-swap-test.js text/javascript
           });
         }
 
-        if (endpoint === "player" || endpoint === "next") {
-          remember({
-            event: "aggressive-replay-miss",
-            endpoint,
-            transport: meta.transport,
-            requestVideoId,
-            expectedVideoId: handoffState.replay.videoId,
-            videoMatches,
-            hasPlayerJson: !!handoffState.replay.playerJson,
-            hasNextJson: !!handoffState.replay.nextJson,
-            url: meta.url,
-            bodyTopKeys: meta.bodyJson ? Object.keys(meta.bodyJson).slice(0, 30) : [],
-            currentEffectiveVideoId: getCurrentEffectiveVideoId(),
-            ageMs: Math.round(performance.now() - handoffState.replay.startedAt),
-          });
-        }
+        remember({
+          event: "aggressive-replay-request-seen",
+          endpoint,
+          transport: meta.transport,
+          url: meta.url,
+          method: meta.method,
+          requestVideoId,
+          bodyType: meta.bodyType,
+          bodyTextLength: meta.bodyTextLength,
+          bodyTopKeys: meta.bodyJson ? Object.keys(meta.bodyJson).slice(0, 30) : [],
+          ageMs: Math.round(performance.now() - handoffState.replay.startedAt),
+        });
       }
 
       counters.seen++;
@@ -2781,64 +2777,47 @@ yt-source-swap-test.js text/javascript
             !requestVideoId ||
             requestVideoId === handoffState.replay.videoId;
 
-          if (endpoint === "player" || endpoint === "next") {
-            remember({
-              event: "aggressive-replay-xhr-seen",
-              endpoint,
-              transport: meta.transport,
-              requestVideoId,
-              expectedVideoId: handoffState.replay.videoId,
-              videoMatches,
-              hasPlayerJson: !!handoffState.replay.playerJson,
-              hasNextJson: !!handoffState.replay.nextJson,
-              bodyTopKeys: meta.bodyJson ? Object.keys(meta.bodyJson).slice(0, 30) : [],
-              ageMs: Math.round(performance.now() - handoffState.replay.startedAt),
-            });
+          let responseJson = null;
 
-            let responseJson = null;
-
-            if (videoMatches && endpoint === "player" && handoffState.replay.playerJson) {
-              handoffState.replay.playerHits++;
-              responseJson = handoffState.replay.playerJson;
-            } else if (videoMatches && endpoint === "next" && handoffState.replay.nextJson) {
-              handoffState.replay.nextHits++;
-              responseJson = handoffState.replay.nextJson;
-            }
-
-            if (responseJson) {
-              remember({
-                event: "aggressive-replay-hit",
-                endpoint,
-                transport: meta.transport,
-                videoId: handoffState.replay.videoId,
-                ageMs: Math.round(performance.now() - handoffState.replay.startedAt),
-              });
-
-              const responseText = JSON.stringify(responseJson);
-
-              finishSyntheticXhr(xhr, {
-                json: responseJson,
-                responseText,
-              }, meta.url);
-
-              return;
-            }
-
-            remember({
-              event: "aggressive-replay-miss",
-              endpoint,
-              transport: meta.transport,
-              requestVideoId,
-              expectedVideoId: handoffState.replay.videoId,
-              videoMatches,
-              hasPlayerJson: !!handoffState.replay.playerJson,
-              hasNextJson: !!handoffState.replay.nextJson,
-              url: meta.url,
-              bodyTopKeys: meta.bodyJson ? Object.keys(meta.bodyJson).slice(0, 30) : [],
-              currentEffectiveVideoId: getCurrentEffectiveVideoId(),
-              ageMs: Math.round(performance.now() - handoffState.replay.startedAt),
-            });
+          if (videoMatches && endpoint === "player" && handoffState.replay.playerJson) {
+            handoffState.replay.playerHits++;
+            responseJson = handoffState.replay.playerJson;
+          } else if (videoMatches && endpoint === "next" && handoffState.replay.nextJson) {
+            handoffState.replay.nextHits++;
+            responseJson = handoffState.replay.nextJson;
           }
+
+          if (responseJson) {
+            remember({
+              event: "aggressive-replay-hit",
+              endpoint,
+              transport: meta.transport,
+              videoId: handoffState.replay.videoId,
+              ageMs: Math.round(performance.now() - handoffState.replay.startedAt),
+            });
+
+            const responseText = JSON.stringify(responseJson);
+
+            finishSyntheticXhr(xhr, {
+              json: responseJson,
+              responseText,
+            }, meta.url);
+
+            return;
+          }
+
+          remember({
+            event: "aggressive-replay-request-seen",
+            endpoint,
+            transport: meta.transport,
+            url: meta.url,
+            method: meta.method,
+            requestVideoId,
+            bodyType: meta.bodyType,
+            bodyTextLength: meta.bodyTextLength,
+            bodyTopKeys: meta.bodyJson ? Object.keys(meta.bodyJson).slice(0, 30) : [],
+            ageMs: Math.round(performance.now() - handoffState.replay.startedAt),
+          });
         }
 
         const [shouldAttempt, reason] = shouldAttemptSwap(meta);
