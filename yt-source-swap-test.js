@@ -108,6 +108,8 @@ yt-source-swap-test.js text/javascript
       bridgeReadyTimeoutMs: 900,
       bridgeFadeMs: 160,
       bridgeMaxMs: 16000,
+      bridgeRevealSyncMs: 700,
+      bridgeRevealMaxDriftSeconds: 0.75,
       visibleReloadProbeDelays: [250, 750, 1500, 3000, 6000, 9000, 12000],
     },
     endpoints: {
@@ -2095,6 +2097,127 @@ yt-source-swap-test.js text/javascript
     return { ok: false, reason: "timeout" };
   }
 
+  async function syncVisibleBlobToBridgeBeforeReveal(videoId, resumeAt, reason = "bridge-reveal") {
+    const bridge = bridgeState.video;
+    const visible = getVisibleVideo();
+    const player = getMoviePlayer();
+    const visibleSrc = String(visible?.currentSrc || "");
+    const bridgeTime = Number(bridge?.currentTime || 0);
+    const visibleTime = Number(visible?.currentTime || 0);
+    const resumeTime = Math.max(0, Number(resumeAt || 0));
+    const targetTime = Math.max(resumeTime, bridgeState.ready ? bridgeTime : 0);
+    const maxDrift = Math.max(0.1, Number(config.hiddenWarmup?.bridgeRevealMaxDriftSeconds || 0.75));
+    const shouldSeek =
+      !!visible &&
+      visibleSrc.startsWith("blob:") &&
+      Number.isFinite(targetTime) &&
+      targetTime > 0 &&
+      targetTime - visibleTime > maxDrift;
+
+    remember({
+      event: "bridge-visible-reveal-sync-start",
+      reason,
+      videoId,
+      resumeAt: resumeTime,
+      targetTime,
+      visibleTime,
+      bridgeTime,
+      shouldSeek,
+      videoState: summarizeVideoElementState(),
+      bridgeState: summarizeBridgeVideoState(),
+    });
+
+    if (!visible || !visibleSrc.startsWith("blob:")) {
+      return { ok: false, reason: !visible ? "no-visible-video" : "visible-not-blob" };
+    }
+
+    if (shouldSeek) {
+      try {
+        if (player && typeof player.seekTo === "function") {
+          player.seekTo(targetTime, true);
+        } else {
+          visible.currentTime = targetTime;
+        }
+      } catch (err) {
+        remember({
+          event: "bridge-visible-reveal-sync-seek-failed",
+          reason,
+          videoId,
+          targetTime,
+          error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
+          videoState: summarizeVideoElementState(),
+          bridgeState: summarizeBridgeVideoState(),
+        });
+      }
+    }
+
+    if (visible.paused && player && typeof player.playVideo === "function") {
+      try {
+        player.playVideo();
+      } catch {}
+    }
+
+    const timeoutMs = Math.max(0, Number(config.hiddenWarmup?.bridgeRevealSyncMs || 700));
+    const startedAt = performance.now();
+
+    while (performance.now() - startedAt < timeoutMs) {
+      const current = getVisibleVideo();
+      const currentTime = Number(current?.currentTime || 0);
+      const currentSrc = String(current?.currentSrc || "");
+      const timeOk =
+        !shouldSeek ||
+        targetTime <= 1 ||
+        currentTime >= targetTime - maxDrift ||
+        Math.abs(currentTime - targetTime) <= maxDrift;
+
+      if (
+        current &&
+        currentSrc.startsWith("blob:") &&
+        !current.error &&
+        current.readyState >= 2 &&
+        !current.paused &&
+        timeOk
+      ) {
+        remember({
+          event: "bridge-visible-reveal-sync-complete",
+          reason,
+          videoId,
+          ok: true,
+          waitMs: Math.round(performance.now() - startedAt),
+          targetTime,
+          visibleTime: currentTime,
+          bridgeTime: Number(bridge?.currentTime || 0),
+          videoState: summarizeVideoElementState(),
+          bridgeState: summarizeBridgeVideoState(),
+        });
+
+        return { ok: true, reason: "synced", targetTime, visibleTime: currentTime };
+      }
+
+      await delay(50);
+    }
+
+    remember({
+      event: "bridge-visible-reveal-sync-complete",
+      reason,
+      videoId,
+      ok: false,
+      waitMs: Math.round(performance.now() - startedAt),
+      targetTime,
+      visibleTime: Number(getVisibleVideo()?.currentTime || 0),
+      bridgeTime: Number(bridge?.currentTime || 0),
+      videoState: summarizeVideoElementState(),
+      bridgeState: summarizeBridgeVideoState(),
+    });
+
+    return {
+      ok: false,
+      reason: "sync-timeout",
+      targetTime,
+      visibleTime: Number(getVisibleVideo()?.currentTime || 0),
+    };
+  }
+
   function getHiddenWarmDocument() {
     try {
       return hiddenWarmState.frame?.contentDocument ||
@@ -3458,16 +3581,51 @@ yt-source-swap-test.js text/javascript
       });
 
       stabilizeAggressiveBlobPlayback(videoId, resumeAt, `probe-${delayMs}`);
+
+      const probeResult = evaluateAggressiveHandoffSuccess(videoId, resumeAt);
+
+      if (probeResult.ok) {
+        const revealSync = await syncVisibleBlobToBridgeBeforeReveal(
+          videoId,
+          resumeAt,
+          `probe-${delayMs}`
+        );
+
+        remember({
+          event: "aggressive-handoff-success",
+          videoId,
+          resumeAt,
+          delayMs,
+          result: evaluateAggressiveHandoffSuccess(videoId, resumeAt),
+          revealSync,
+          bridgeState: summarizeBridgeVideoState(),
+        });
+
+        clearBridgeVideo("visible-blob-ready", true);
+
+        return {
+          attempted: true,
+          ok: true,
+          reason: "aggressive-blob-handoff-success",
+        };
+      }
     }
 
     const result = evaluateAggressiveHandoffSuccess(videoId, resumeAt);
 
     if (result.ok) {
+      const revealSync = await syncVisibleBlobToBridgeBeforeReveal(
+        videoId,
+        resumeAt,
+        "final-probe"
+      );
+
       remember({
         event: "aggressive-handoff-success",
         videoId,
         resumeAt,
-        result,
+        result: evaluateAggressiveHandoffSuccess(videoId, resumeAt),
+        revealSync,
         bridgeState: summarizeBridgeVideoState(),
       });
 
