@@ -1470,6 +1470,44 @@ yt-source-swap-test.js text/javascript
     return record;
   }
 
+  function summarizeVideoElementStateWithIdentity() {
+    const v = document.querySelector("video");
+
+    if (!v) {
+      return {
+        state: { hasVideo: false },
+        identity: summarizeSourceIdentity(""),
+      };
+    }
+
+    const currentSrc = String(v.currentSrc || "");
+
+    const state = {
+      hasVideo: true,
+      currentSrc,
+      readyState: v.readyState,
+      networkState: v.networkState,
+      paused: v.paused,
+      currentTime: v.currentTime,
+      duration: v.duration,
+      error: v.error
+        ? {
+            code: v.error.code,
+            message: v.error.message,
+          }
+        : null,
+    };
+
+    return {
+      state,
+      identity: summarizeSourceIdentity(currentSrc),
+    };
+  }
+
+  function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
   function waitForVideoEventOrTimeout(video, eventNames, timeoutMs = 4000) {
     return new Promise(resolve => {
       let done = false;
@@ -1646,7 +1684,9 @@ yt-source-swap-test.js text/javascript
     });
 
     try {
-      const before = summarizeVideoElementState();
+      const beforeSnapshot = summarizeVideoElementStateWithIdentity();
+      const before = beforeSnapshot.state;
+      const beforeIdentity = beforeSnapshot.identity;
       const candidateIdentity = summarizeSourceIdentity(candidate.url);
       const resumeAt = Number(v.currentTime || 0);
       const wasPaused = !!v.paused;
@@ -1654,31 +1694,77 @@ yt-source-swap-test.js text/javascript
       const oldMuted = v.muted;
       const oldPlaybackRate = v.playbackRate;
 
-      v.src = candidate.url;
-      v.currentTime = resumeAt;
-      v.volume = oldVolume;
-      v.muted = oldMuted;
-      v.playbackRate = oldPlaybackRate;
-
       remember({
         event: "direct-source-swap-attempt",
         videoId,
         from: before,
+        beforeIdentity,
         candidate: { ...candidate, mechanismTest },
+        candidateIdentity,
       });
 
-      if (!wasPaused) {
-        v.play().catch(() => {});
-      }
-
-      const waitResult = await waitForVideoEventOrTimeout(v, [
+      const waitPromise = waitForVideoEventOrTimeout(v, [
         "loadedmetadata",
         "canplay",
         "playing",
+        "error",
       ], 4000);
 
-      const after = summarizeVideoElementState();
-      const afterIdentity = summarizeSourceIdentity(v.currentSrc);
+      v.src = candidate.url;
+
+      if (typeof v.load === "function") {
+        v.load();
+      }
+
+      try {
+        if (Number.isFinite(resumeAt) && resumeAt > 0) {
+          v.currentTime = resumeAt;
+        }
+      } catch {}
+
+      v.volume = oldVolume;
+      v.muted = oldMuted;
+      v.playbackRate = oldPlaybackRate;
+
+      let playError = "";
+
+      if (!wasPaused) {
+        try {
+          await v.play();
+        } catch (err) {
+          playError = `${err?.name || "Error"}: ${err?.message || String(err)}`;
+        }
+      }
+
+      const waitResult = await waitPromise;
+
+      const probes = [];
+
+      for (const delayMs of [0, 250, 1000, 2500]) {
+        if (delayMs) await delay(delayMs);
+
+        const snapshot = summarizeVideoElementStateWithIdentity();
+
+        probes.push({
+          delayMs,
+          state: snapshot.state,
+          identity: snapshot.identity,
+        });
+
+        remember({
+          event: "direct-source-swap-verify-probe",
+          videoId,
+          delayMs,
+          candidate: { ...candidate, mechanismTest },
+          candidateIdentity,
+          state: snapshot.state,
+          identity: snapshot.identity,
+        });
+      }
+
+      const finalProbe = probes[probes.length - 1];
+      const after = finalProbe.state;
+      const afterIdentity = finalProbe.identity;
 
       const candidateIdMatches =
         !!candidateIdentity.id &&
@@ -1692,54 +1778,92 @@ yt-source-swap-test.js text/javascript
         afterIdentity.path === candidateIdentity.path &&
         afterIdentity.itag === candidateIdentity.itag;
 
+      const beforeIdMatches =
+        !!beforeIdentity.id &&
+        !!afterIdentity.id &&
+        afterIdentity.id === beforeIdentity.id;
+
+      const beforeHostPathItagMatches =
+        !!beforeIdentity.host &&
+        !!afterIdentity.host &&
+        afterIdentity.host === beforeIdentity.host &&
+        afterIdentity.path === beforeIdentity.path &&
+        afterIdentity.itag === beforeIdentity.itag;
+
       const srcLooksCorrect =
-        /googlevideo\.com\/videoplayback/i.test(v.currentSrc || "") &&
+        /googlevideo\.com\/videoplayback/i.test(after.currentSrc || "") &&
         afterIdentity.itag === candidateIdentity.itag &&
         !afterIdentity.hasSabr &&
         (candidateIdMatches || candidateHostPathItagMatches);
 
-      const noError = !v.error;
-      const readyOk = v.readyState >= 2;
-      const timeOk = Math.abs(after.currentTime - resumeAt) < 2;
+      const revertedToStartupSource =
+        !srcLooksCorrect &&
+        /googlevideo\.com\/videoplayback/i.test(after.currentSrc || "") &&
+        (beforeIdMatches || beforeHostPathItagMatches);
+
+      const noError = !after.error;
+      const readyOk = Number(after.readyState || 0) >= 2;
+      const timeOk = Math.abs(Number(after.currentTime || 0) - resumeAt) < 2;
       const playingOk = wasPaused || !after.paused;
 
       let verifyReason = "";
-      if (!srcLooksCorrect) verifyReason = "src-mismatch";
-      else if (!noError) verifyReason = "video-error";
-      else if (!readyOk) verifyReason = "readyState-low";
-      else if (!timeOk) verifyReason = "time-reset";
-      else if (!playingOk) verifyReason = "playback-stopped";
 
-      if (!waitResult.ok || verifyReason) {
+      if (!srcLooksCorrect && revertedToStartupSource) {
+        verifyReason = "source-reverted-to-startup";
+      } else if (!srcLooksCorrect) {
+        verifyReason = "src-mismatch";
+      } else if (!noError) {
+        verifyReason = "video-error";
+      } else if (!readyOk) {
+        verifyReason = "readyState-low";
+      } else if (!timeOk) {
+        verifyReason = "time-reset";
+      } else if (!playingOk) {
+        verifyReason = "playback-stopped";
+      }
+
+      if (verifyReason) {
         remember({
           event: "direct-source-swap-verify-failed",
           videoId,
-          reason: verifyReason || "wait-failed",
+          reason: verifyReason,
           candidate: { ...candidate, mechanismTest },
           candidateIdentity,
           candidateIdMatches,
           candidateHostPathItagMatches,
-          srcLooksCorrect,
           before,
+          beforeIdentity,
           after,
           afterIdentity,
+          beforeIdMatches,
+          beforeHostPathItagMatches,
+          srcLooksCorrect,
+          revertedToStartupSource,
           waitResult,
+          playError: playError || null,
+          probes,
         });
 
-        return { attempted: true, ok: false, reason: verifyReason || "verify-failed" };
+        return { attempted: true, ok: false, reason: verifyReason };
       }
 
       remember({
         event: "direct-source-swap-success",
         videoId,
         from: before,
+        beforeIdentity,
         to: after,
+        afterIdentity,
         candidate: { ...candidate, mechanismTest },
         candidateIdentity,
         candidateIdMatches,
         candidateHostPathItagMatches,
+        beforeIdMatches,
+        beforeHostPathItagMatches,
         srcLooksCorrect,
         waitResult,
+        playError: playError || null,
+        probes,
       });
 
       return { attempted: true, ok: true };
