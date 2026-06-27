@@ -111,6 +111,8 @@ yt-source-swap-test.js text/javascript
       bridgeRevealSyncMs: 700,
       bridgeRevealMaxDriftSeconds: 0.75,
       bridgeZIndex: 30,
+      bridgeLiftControlsAboveBridge: true,
+      bridgeControlsZIndex: 2147483647,
       visibleReloadProbeDelays: [250, 750, 1500, 3000, 4000, 5000, 6000, 9000, 12000],
     },
     endpoints: {
@@ -1803,6 +1805,7 @@ yt-source-swap-test.js text/javascript
       duration: v.duration,
       ageMs: Math.round(performance.now() - bridgeState.startedAt),
       opacity: bridgeState.container?.style?.opacity || "",
+      controlsGuardActive: getMoviePlayer()?.getAttribute("data-yt-source-swap-bridging") === "1",
       error: v.error
         ? {
             code: v.error.code,
@@ -1834,6 +1837,7 @@ yt-source-swap-test.js text/javascript
       container.style.bottom = "0";
       container.style.width = "100%";
       container.style.height = "100%";
+      markBridgeControlsActive(host, true);
       return;
     }
 
@@ -1843,6 +1847,7 @@ yt-source-swap-test.js text/javascript
     const rect = getVisiblePlayerBounds();
     if (!rect) {
       container.style.inset = "0";
+      markBridgeControlsActive(getMoviePlayer(), true);
       return;
     }
 
@@ -1850,6 +1855,58 @@ yt-source-swap-test.js text/javascript
     container.style.top = `${Math.round(rect.top)}px`;
     container.style.width = `${Math.round(rect.width)}px`;
     container.style.height = `${Math.round(rect.height)}px`;
+    markBridgeControlsActive(getMoviePlayer(), true);
+  }
+
+  function ensureBridgeControlStyle() {
+    if (document.getElementById("yt-source-swap-bridge-control-style")) return;
+
+    const style = document.createElement("style");
+    const chromeZ = Number(config.hiddenWarmup?.bridgeControlsZIndex || 2147483647);
+
+    style.id = "yt-source-swap-bridge-control-style";
+    style.textContent = `
+      #movie_player[data-yt-source-swap-bridging="1"] .ytp-chrome-bottom,
+      #movie_player[data-yt-source-swap-bridging="1"] .ytp-chrome-top,
+      #movie_player[data-yt-source-swap-bridging="1"] .ytp-gradient-bottom,
+      #movie_player[data-yt-source-swap-bridging="1"] .ytp-gradient-top,
+      #movie_player[data-yt-source-swap-bridging="1"] .ytp-progress-bar-container,
+      #movie_player[data-yt-source-swap-bridging="1"] .ytp-popup,
+      #movie_player[data-yt-source-swap-bridging="1"] .ytp-settings-menu,
+      #movie_player[data-yt-source-swap-bridging="1"] .ytp-tooltip {
+        z-index: ${chromeZ} !important;
+      }
+    `;
+
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  function markBridgeControlsActive(host, active) {
+    if (!config.hiddenWarmup?.bridgeLiftControlsAboveBridge) return;
+
+    ensureBridgeControlStyle();
+
+    const player =
+      (host && host.id === "movie_player" ? host : null) ||
+      getMoviePlayer();
+
+    if (!player) return;
+
+    try {
+      if (active) {
+        player.setAttribute("data-yt-source-swap-bridging", "1");
+      } else {
+        player.removeAttribute("data-yt-source-swap-bridging");
+      }
+    } catch {}
+
+    remember({
+      event: active ? "bridge-controls-layer-active" : "bridge-controls-layer-cleared",
+      bridgeLiftControlsAboveBridge: !!config.hiddenWarmup?.bridgeLiftControlsAboveBridge,
+      playerClassName: String(player.className || ""),
+      hasChromeBottom: !!player.querySelector?.(".ytp-chrome-bottom"),
+      hasChromeTop: !!player.querySelector?.(".ytp-chrome-top"),
+    });
   }
 
   function resetBridgeState() {
@@ -1878,6 +1935,8 @@ yt-source-swap-test.js text/javascript
     const previous = summarizeBridgeVideoState();
 
     const finish = () => {
+      markBridgeControlsActive(getMoviePlayer(), false);
+
       try {
         video?.pause();
       } catch {}
