@@ -359,6 +359,76 @@ yt-source-swap-test.js text/javascript
     );
   }
 
+  function nudgeVisiblePlayback(videoId = "", reason = "playback-nudge") {
+    const currentVideoId = getCurrentEffectiveVideoId();
+    if (videoId && currentVideoId && currentVideoId !== videoId) return false;
+
+    const player = getMoviePlayer();
+    const v = getVisibleVideo();
+    let attemptedPlayer = false;
+    let attemptedVideo = false;
+
+    if (player && typeof player.playVideo === "function") {
+      try {
+        attemptedPlayer = true;
+        player.playVideo();
+      } catch (err) {
+        remember({
+          event: "visible-playback-nudge-failed",
+          reason,
+          target: "movie_player",
+          videoId,
+          error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
+          videoState: summarizeVideoElementState(),
+          bridgeState: summarizeBridgeVideoState(),
+        });
+      }
+    }
+
+    if (v && typeof v.play === "function") {
+      try {
+        attemptedVideo = true;
+        const p = v.play();
+        if (p && typeof p.catch === "function") {
+          p.catch(err => {
+            remember({
+              event: "visible-playback-nudge-failed",
+              reason,
+              target: "video",
+              videoId,
+              error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
+              videoState: summarizeVideoElementState(),
+              bridgeState: summarizeBridgeVideoState(),
+            });
+          });
+        }
+      } catch (err) {
+        remember({
+          event: "visible-playback-nudge-failed",
+          reason,
+          target: "video",
+          videoId,
+          error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
+          videoState: summarizeVideoElementState(),
+          bridgeState: summarizeBridgeVideoState(),
+        });
+      }
+    }
+
+    remember({
+      event: "visible-playback-nudge",
+      reason,
+      videoId,
+      currentVideoId,
+      attemptedPlayer,
+      attemptedVideo,
+      videoState: summarizeVideoElementState(),
+      bridgeState: summarizeBridgeVideoState(),
+    });
+
+    return attemptedPlayer || attemptedVideo;
+  }
+
   function isVisiblePatchedMweb360Source() {
     const v = getVisibleVideo();
     const src = String(v?.currentSrc || "");
@@ -2006,6 +2076,31 @@ yt-source-swap-test.js text/javascript
       bridge.muted = !!audio.videoMuted;
       bridgeState.bridgeAudioLive = !bridge.muted && Number(bridge.volume || 0) > 0;
 
+      try {
+        const p = bridge.play();
+        if (p && typeof p.catch === "function") {
+          p.catch(err => {
+            remember({
+              event: "bridge-audio-live-play-failed",
+              reason,
+              videoId: bridgeState.videoId,
+              error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
+              bridgeState: summarizeBridgeVideoState(),
+              videoState: summarizeVideoElementState(),
+            });
+          });
+        }
+      } catch (err) {
+        remember({
+          event: "bridge-audio-live-play-failed",
+          reason,
+          videoId: bridgeState.videoId,
+          error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
+          bridgeState: summarizeBridgeVideoState(),
+          videoState: summarizeVideoElementState(),
+        });
+      }
+
       remember({
         event: "bridge-audio-live",
         reason,
@@ -2076,6 +2171,8 @@ yt-source-swap-test.js text/javascript
       visible.volume = Number.isFinite(audio.videoVolume) ? audio.videoVolume : visible.volume;
       visible.muted = !!audio.videoMuted;
       bridgeState.nativeAudioMuted = false;
+
+      nudgeVisiblePlayback(bridgeState.videoId, `${reason}-after-native-restore`);
 
       remember({
         event: "bridge-native-audio-restored",
@@ -3791,6 +3888,11 @@ yt-source-swap-test.js text/javascript
           suggestedQuality: "hd720",
         });
 
+        nudgeVisiblePlayback(videoId, "after-loadVideoById");
+        setTimeout(() => nudgeVisiblePlayback(videoId, "after-loadVideoById-plus-150ms"), 150);
+        setTimeout(() => nudgeVisiblePlayback(videoId, "after-loadVideoById-plus-500ms"), 500);
+        setTimeout(() => nudgeVisiblePlayback(videoId, "after-loadVideoById-plus-1500ms"), 1500);
+
         if (bridgeResult.ok) {
           setTimeout(() => muteVisibleNativeAudioForBridge("loadVideoById-plus-100ms"), 100);
           setTimeout(() => muteVisibleNativeAudioForBridge("loadVideoById-plus-500ms"), 500);
@@ -3859,6 +3961,10 @@ yt-source-swap-test.js text/javascript
 
       if (bridgeResult.ok) {
         muteVisibleNativeAudioForBridge(`probe-${delayMs}`);
+      }
+
+      if (getVisibleVideo()?.paused) {
+        nudgeVisiblePlayback(videoId, `probe-${delayMs}`);
       }
 
       stabilizeAggressiveBlobPlayback(videoId, resumeAt, `probe-${delayMs}`);
