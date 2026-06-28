@@ -226,6 +226,7 @@ yt-source-swap-test.js text/javascript
     clearing: false,
     originalAudio: null,
     nativeAudioMuted: false,
+    bridgeAudioLive: false,
   };
 
   function log(...args) {
@@ -1812,6 +1813,7 @@ yt-source-swap-test.js text/javascript
       opacity: bridgeState.container?.style?.opacity || "",
       controlsGuardActive: getMoviePlayer()?.getAttribute("data-yt-source-swap-bridging") === "1",
       nativeAudioMuted: bridgeState.nativeAudioMuted,
+      bridgeAudioLive: bridgeState.bridgeAudioLive,
       originalAudio: bridgeState.originalAudio,
       error: v.error
         ? {
@@ -1962,8 +1964,8 @@ yt-source-swap-test.js text/javascript
       if (shouldUseMuted) {
         visible.muted = true;
       } else {
-        visible.muted = false;
         visible.volume = 0;
+        visible.muted = false;
       }
 
       bridgeState.nativeAudioMuted = true;
@@ -1991,6 +1993,75 @@ yt-source-swap-test.js text/javascript
     }
   }
 
+  function enableBridgeAudioForHandoff(reason = "bridge-audio-live") {
+    if (!config.hiddenWarmup?.bridgeOwnsAudioDuringReload) return false;
+
+    const bridge = bridgeState.video;
+    const audio = bridgeState.originalAudio;
+
+    if (!bridge || !audio) return false;
+
+    try {
+      bridge.volume = Number.isFinite(audio.videoVolume) ? audio.videoVolume : 1;
+      bridge.muted = !!audio.videoMuted;
+      bridgeState.bridgeAudioLive = !bridge.muted && Number(bridge.volume || 0) > 0;
+
+      remember({
+        event: "bridge-audio-live",
+        reason,
+        videoId: bridgeState.videoId,
+        originalAudio: audio,
+        bridgeState: summarizeBridgeVideoState(),
+        videoState: summarizeVideoElementState(),
+      });
+
+      return true;
+    } catch (err) {
+      remember({
+        event: "bridge-audio-live-failed",
+        reason,
+        videoId: bridgeState.videoId,
+        error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
+        bridgeState: summarizeBridgeVideoState(),
+        videoState: summarizeVideoElementState(),
+      });
+
+      return false;
+    }
+  }
+
+  function silenceBridgeAudio(reason = "bridge-audio-silenced") {
+    const bridge = bridgeState.video;
+    if (!bridge) return false;
+
+    try {
+      bridge.muted = true;
+      bridge.volume = 0;
+      bridgeState.bridgeAudioLive = false;
+
+      remember({
+        event: "bridge-audio-silenced",
+        reason,
+        videoId: bridgeState.videoId,
+        bridgeState: summarizeBridgeVideoState(),
+        videoState: summarizeVideoElementState(),
+      });
+
+      return true;
+    } catch (err) {
+      remember({
+        event: "bridge-audio-silence-failed",
+        reason,
+        videoId: bridgeState.videoId,
+        error: `${err?.name || "Error"}: ${err?.message || String(err)}`,
+        bridgeState: summarizeBridgeVideoState(),
+        videoState: summarizeVideoElementState(),
+      });
+
+      return false;
+    }
+  }
+
   function restoreVisibleNativeAudioAfterBridge(reason = "bridge-native-audio-restore") {
     if (!config.hiddenWarmup?.bridgeOwnsAudioDuringReload) return false;
 
@@ -2000,16 +2071,11 @@ yt-source-swap-test.js text/javascript
     if (!visible || !audio) return false;
 
     try {
+      silenceBridgeAudio(`${reason}-before-native-restore`);
+
       visible.volume = Number.isFinite(audio.videoVolume) ? audio.videoVolume : visible.volume;
       visible.muted = !!audio.videoMuted;
       bridgeState.nativeAudioMuted = false;
-
-      if (bridgeState.video) {
-        bridgeState.video.muted = true;
-        try {
-          bridgeState.video.volume = 0;
-        } catch {}
-      }
 
       remember({
         event: "bridge-native-audio-restored",
@@ -2047,6 +2113,7 @@ yt-source-swap-test.js text/javascript
     bridgeState.clearing = false;
     bridgeState.originalAudio = null;
     bridgeState.nativeAudioMuted = false;
+    bridgeState.bridgeAudioLive = false;
   }
 
   function clearBridgeVideo(reason = "clear", fade = false) {
@@ -2154,8 +2221,8 @@ yt-source-swap-test.js text/javascript
     video.playsInline = true;
     video.controls = false;
     video.preload = "auto";
-    video.muted = !!visible.muted;
-    video.volume = Number.isFinite(visible.volume) ? visible.volume : 1;
+    video.muted = true;
+    video.volume = 0;
     video.playbackRate = Number.isFinite(visible.playbackRate) ? visible.playbackRate : 1;
     video.style.width = "100%";
     video.style.height = "100%";
@@ -2180,6 +2247,7 @@ yt-source-swap-test.js text/javascript
     bridgeState.clearing = false;
     bridgeState.originalAudio = captureBridgeAudioState(visible);
     bridgeState.nativeAudioMuted = false;
+    bridgeState.bridgeAudioLive = false;
     bridgeState.timer = setTimeout(() => {
       clearBridgeVideo("bridge-max-ms-expired", true);
     }, Math.max(1000, Number(config.hiddenWarmup?.bridgeMaxMs || 16000)));
@@ -3712,6 +3780,11 @@ yt-source-swap-test.js text/javascript
 
     if (player && typeof player.loadVideoById === "function") {
       try {
+        if (bridgeResult.ok) {
+          muteVisibleNativeAudioForBridge("before-loadVideoById");
+          enableBridgeAudioForHandoff("before-loadVideoById");
+        }
+
         player.loadVideoById({
           videoId,
           startSeconds: Math.max(0, resumeAt),
@@ -3719,7 +3792,6 @@ yt-source-swap-test.js text/javascript
         });
 
         if (bridgeResult.ok) {
-          muteVisibleNativeAudioForBridge("loadVideoById-called");
           setTimeout(() => muteVisibleNativeAudioForBridge("loadVideoById-plus-100ms"), 100);
           setTimeout(() => muteVisibleNativeAudioForBridge("loadVideoById-plus-500ms"), 500);
           setTimeout(() => muteVisibleNativeAudioForBridge("loadVideoById-plus-1500ms"), 1500);
