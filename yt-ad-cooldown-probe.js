@@ -231,7 +231,8 @@
     if (jsonToScan) {
       const found = recursiveFindAdKeys(jsonToScan);
       if (found.length > 0) {
-        subCategories.push("ad-relevant");
+        const hasStrong = found.some(f => f.strength === "strong");
+        subCategories.push(hasStrong ? "strong-ad" : "weak-ad-context");
       }
     }
 
@@ -253,6 +254,21 @@
     "adSafetyReason", "paidContentOverlay",
     "playerAttestationRenderer", "adPlacementRenderer",
   ];
+
+  const STRONG_AD_KEYS = new Set([
+    "adPlacements", "playerAds", "adSlots",
+    "adBreakHeartbeatParams", "adBreakParams",
+    "adPlacementRenderer",
+  ]);
+
+  const WEAK_AD_KEYS = new Set([
+    "adSignalsInfo", "adInferredBlockingStatus",
+    "adSafetyReason", "paidContentOverlay",
+    "playerAttestationRenderer",
+  ]);
+
+  function isStrongAdKey(key) { return STRONG_AD_KEYS.has(key); }
+  function isWeakAdKey(key) { return WEAK_AD_KEYS.has(key); }
 
   function recursiveFindAdKeys(root) {
     const found = [];
@@ -314,6 +330,7 @@
             type: kind,
             count: Array.isArray(child) ? child.length : undefined,
             present: child != null,
+            strength: isStrongAdKey(key) ? "strong" : "weak",
           });
         }
 
@@ -334,12 +351,21 @@
     const byKey = {};
     for (const f of found) {
       if (!byKey[f.key]) byKey[f.key] = [];
-      byKey[f.key].push({ path: f.path, type: f.type, count: f.count });
+      byKey[f.key].push({ path: f.path, type: f.type, count: f.count, strength: f.strength });
     }
+
+    const strongFound = found.filter(f => f.strength === "strong");
+    const weakFound = found.filter(f => f.strength === "weak");
 
     return {
       foundCount: found.length,
+      strongCount: strongFound.length,
+      weakCount: weakFound.length,
+      hasAnyStrong: strongFound.length > 0,
+      hasAnyWeak: weakFound.length > 0,
       distinctKeys: Object.keys(byKey),
+      strongKeys: [...new Set(strongFound.map(f => f.key))],
+      weakKeys: [...new Set(weakFound.map(f => f.key))],
       details: byKey,
     };
   }
@@ -635,7 +661,7 @@
       const player = document.getElementById("movie_player") || document.querySelector("#movie_player");
       if (player) {
         const adClasses = Array.from(player.classList).filter(c =>
-          /^(?:ad-|ads-|ad_|adinterrupt|ad-show|ad-playing|unstarted)/i.test(c)
+          /^(?:ad-created|ad-showing|ad-interrupting|ad-playing|ad-loading)$/i.test(c)
         );
         if (adClasses.length) {
           state.playerAdClass = adClasses.join(" ");
@@ -962,8 +988,9 @@
       networkRows.shift();
     }
 
-    // Log events for ad-relevant requests
-    if (adFindings && adFindings.foundCount > 0) {
+    // Log events for strong ad-relevant requests only (weak context like adSignalsInfo
+    // is recorded on the row but does not trigger ad session timeline entries).
+    if (adFindings && adFindings.hasAnyStrong) {
       const cookieIdx = config.cookieSnapshots
         ? snapshotCookies("ad-response-received", url) : -1;
 
@@ -974,8 +1001,9 @@
           ms: Math.round(performance.now()),
           cookieSnapshotIndex: cookieIdx,
           endpoint: classification.subCategories.join(","),
-          adFoundKeys: adFindings.distinctKeys,
-          adFoundCount: adFindings.foundCount,
+          adFoundKeys: adFindings.strongKeys,
+          adFoundCount: adFindings.strongCount,
+          strength: "strong",
         });
       }
 
@@ -989,7 +1017,11 @@
         responseStatus,
         adFindings: {
           foundCount: adFindings.foundCount,
+          strongCount: adFindings.strongCount,
+          weakCount: adFindings.weakCount,
           distinctKeys: adFindings.distinctKeys,
+          strongKeys: adFindings.strongKeys,
+          weakKeys: adFindings.weakKeys,
         },
         cookieSnapshotIndex: cookieIdx,
       });
@@ -1578,9 +1610,10 @@
 
   function getCurrentVideoId() {
     try {
-      return document.querySelector("ytd-watch-flexy")?.getAttribute("video-id") ||
-        new URL(location.href).searchParams.get("v") ||
-        "";
+      const urlId = new URL(location.href).searchParams.get("v");
+      if (urlId) return urlId;
+
+      return document.querySelector("ytd-watch-flexy")?.getAttribute("video-id") || "";
     } catch {
       return "";
     }
@@ -1751,8 +1784,18 @@
         sess.steps[i].deltaFromPreviousMs = Math.round(sess.steps[i].ms - sess.steps[i - 1].ms);
       }
 
+      // Skip cooldown computation for incomplete sessions (no endMs)
+      if (sess.endMs == null) {
+        sess.nextOpportunityDeltaMs = null;
+        sess.nextOpportunityEndpoint = null;
+        sess.nextOpportunityHadStrongAdData = null;
+        sess.nextOpportunityHadWeakAdContext = null;
+        chain.push(sess);
+        continue;
+      }
+
       // Compute gap from ad-end to next ad-eligible youtubei player/get_watch/next request.
-      // The cooldown signal is in hadAdData=false, not just finding the next ad response.
+      // The cooldown signal is in hadStrongAdData=false, not just finding the next ad response.
       const nextOpportunity = networkRows
         .filter(r =>
           rowEventMs(r) > sess.endMs &&
@@ -1767,8 +1810,11 @@
       sess.nextOpportunityEndpoint = nextOpportunity
         ? nextOpportunity.subCategories.join(",")
         : null;
-      sess.nextOpportunityHadAdData = nextOpportunity
-        ? !!(nextOpportunity.adFindings && nextOpportunity.adFindings.foundCount > 0)
+      sess.nextOpportunityHadStrongAdData = nextOpportunity
+        ? !!(nextOpportunity.adFindings && nextOpportunity.adFindings.hasAnyStrong)
+        : null;
+      sess.nextOpportunityHadWeakAdContext = nextOpportunity
+        ? !!(nextOpportunity.adFindings && nextOpportunity.adFindings.hasAnyWeak)
         : null;
 
       chain.push(sess);
@@ -1885,9 +1931,10 @@
           adDurationSeconds: adEnd.durationSeconds,
           nextYoutubeiDeltaSeconds: parseFloat(((rowEventMs(sameVideoYoutubei[0]) - adEnd.ms) / 1000).toFixed(1)),
           nextYoutubeiEndpoint: sameVideoYoutubei[0].subCategories.join(","),
-          nextYoutubeiHadAdData: !!(sameVideoYoutubei[0].adFindings?.foundCount > 0),
-          sameVideoAdOpportunityCount: sameVideoYoutubei.filter(r => r.adFindings?.foundCount > 0).length,
-          sameVideoNoAdOpportunityCount: sameVideoYoutubei.filter(r => !r.adFindings || r.adFindings.foundCount === 0).length,
+          nextYoutubeiHadStrongAdData: !!(sameVideoYoutubei[0].adFindings?.hasAnyStrong),
+          nextYoutubeiHadWeakAdContext: !!(sameVideoYoutubei[0].adFindings?.hasAnyWeak),
+          sameVideoStrongAdCount: sameVideoYoutubei.filter(r => r.adFindings?.hasAnyStrong).length,
+          sameVideoNoAdCount: sameVideoYoutubei.filter(r => !r.adFindings || !r.adFindings.hasAnyStrong).length,
           sameVideoTotalRequests: sameVideoYoutubei.length,
         });
       }
@@ -1914,11 +1961,14 @@
             ? parseFloat(((rowEventMs(crossNavYoutubei[0]) - adEnd.ms) / 1000).toFixed(1))
             : null,
           nextYoutubeiEndpoint: crossNavYoutubei[0]?.subCategories?.join(",") || null,
-          nextYoutubeiHadAdData: crossNavYoutubei[0]
-            ? !!(crossNavYoutubei[0].adFindings?.foundCount > 0)
+          nextYoutubeiHadStrongAdData: crossNavYoutubei[0]
+            ? !!(crossNavYoutubei[0].adFindings?.hasAnyStrong)
             : null,
-          crossNavAdOpportunityCount: crossNavYoutubei.filter(r => r.adFindings?.foundCount > 0).length,
-          crossNavNoAdOpportunityCount: crossNavYoutubei.filter(r => !r.adFindings || r.adFindings.foundCount === 0).length,
+          nextYoutubeiHadWeakAdContext: crossNavYoutubei[0]
+            ? !!(crossNavYoutubei[0].adFindings?.hasAnyWeak)
+            : null,
+          crossNavStrongAdCount: crossNavYoutubei.filter(r => r.adFindings?.hasAnyStrong).length,
+          crossNavNoAdCount: crossNavYoutubei.filter(r => !r.adFindings || !r.adFindings.hasAnyStrong).length,
         });
       }
     }
@@ -1943,9 +1993,11 @@
         eventMs: rowEventMs(r),
         videoId: r.videoId,
         endpoint: r.subCategories.join(","),
-        hadAdData: !!(r.adFindings && r.adFindings.foundCount > 0),
-        adFoundKeys: r.adFindings?.distinctKeys || [],
-        adFoundCount: r.adFindings?.foundCount || 0,
+        hadStrongAdData: !!(r.adFindings && r.adFindings.hasAnyStrong),
+        hadWeakAdContext: !!(r.adFindings && r.adFindings.hasAnyWeak),
+        strongKeys: r.adFindings?.strongKeys || [],
+        weakKeys: r.adFindings?.weakKeys || [],
+        foundCount: r.adFindings?.foundCount || 0,
         status: r.responseStatus,
       }));
   }
@@ -1988,6 +2040,10 @@
 
   function getAdRelevantRows() {
     return networkRows.filter(r => r.adFindings && r.adFindings.foundCount > 0);
+  }
+
+  function getStrongAdRows() {
+    return networkRows.filter(r => r.adFindings && r.adFindings.hasAnyStrong);
   }
 
   function getRowsByCategory(category) {
@@ -2051,7 +2107,9 @@
           "Next opportunity:",
           sess.nextOpportunityDeltaMs !== null ? sess.nextOpportunityDeltaMs + "ms" : "none",
           sess.nextOpportunityEndpoint ? "(" + sess.nextOpportunityEndpoint + ")" : "",
-          sess.nextOpportunityHadAdData === true ? "[hadAdData]" : sess.nextOpportunityHadAdData === false ? "[NO AD DATA = cooldown]" : ""
+          sess.nextOpportunityHadStrongAdData === true ? "[STRONG ad data]" :
+          sess.nextOpportunityHadWeakAdContext === true ? "[weak context]" :
+          sess.nextOpportunityHadStrongAdData === false ? "[NO AD DATA = cooldown]" : ""
         );
         console.groupEnd();
       }
@@ -2067,9 +2125,10 @@
           adDurationS: r.adDurationSeconds,
           nextYoutubeiDeltaS: r.nextYoutubeiDeltaSeconds,
           nextEndpoint: r.nextYoutubeiEndpoint,
-          hadAdData: r.nextYoutubeiHadAdData,
-          sameVideoAdOps: r.sameVideoAdOpportunityCount,
-          sameVideoNoAdOps: r.sameVideoNoAdOpportunityCount,
+          hadStrongAd: r.nextYoutubeiHadStrongAdData,
+          hadWeakCtx: r.nextYoutubeiHadWeakAdContext,
+          noAdCount: r.sameVideoNoAdCount,
+          totalReqs: r.sameVideoTotalRequests,
         })));
       }
       if (g.crossNavigation.length) {
@@ -2080,7 +2139,8 @@
           adDurationS: r.adDurationSeconds,
           navDeltaS: r.navDeltaSeconds,
           nextYoutubeiDeltaS: r.nextYoutubeiDeltaSeconds,
-          hadAdData: r.nextYoutubeiHadAdData,
+          hadStrongAd: r.nextYoutubeiHadStrongAdData,
+          hadWeakCtx: r.nextYoutubeiHadWeakAdContext,
         })));
       }
       return g;
@@ -2088,6 +2148,10 @@
 
     adRows() {
       return getAdRelevantRows();
+    },
+
+    strongAdRows() {
+      return getStrongAdRows();
     },
 
     adSummary() {
@@ -2111,8 +2175,10 @@
         endpoint: r.endpoint,
         videoId: r.videoId,
         eventMs: r.eventMs,
-        hadAdData: r.hadAdData,
-        adKeys: r.adFoundKeys.join(","),
+        strong: r.hadStrongAdData,
+        weak: r.hadWeakAdContext,
+        strongKeys: r.strongKeys.join(","),
+        weakKeys: r.weakKeys.join(","),
         status: r.status,
       })));
       return rows;
@@ -2184,8 +2250,9 @@
           videoId,
           adEndedSecondsAgo: secondsAgo,
           requestsSinceEnd: requestsSince.length,
-          hadAnyAdDataSince: requestsSince.some(r => r.adFindings?.foundCount > 0),
-          allHadNoAdDataSince: requestsSince.length > 0 && requestsSince.every(r => !r.adFindings || r.adFindings.foundCount === 0),
+          hadStrongAdSince: requestsSince.some(r => r.adFindings?.hasAnyStrong),
+          hadWeakCtxSince: requestsSince.some(r => r.adFindings?.hasAnyWeak),
+          allHadNoAdSince: requestsSince.length > 0 && requestsSince.every(r => !r.adFindings || !r.adFindings.hasAnyStrong),
         });
       }
       console.table(entries);
@@ -2221,6 +2288,13 @@
 
     copyAdRows() {
       const rows = getAdRelevantRows();
+      const text = JSON.stringify(rows, null, 2);
+      try { copy(text); } catch { console.log(text); }
+      return rows.length;
+    },
+
+    copyStrongAdRows() {
+      const rows = getStrongAdRows();
       const text = JSON.stringify(rows, null, 2);
       try { copy(text); } catch { console.log(text); }
       return rows.length;
@@ -2360,10 +2434,10 @@
     "  %c__YT_AD_COOLDOWN_PROBE__.timeline()%c      - cooldown event timeline\n" +
     "  %c__YT_AD_COOLDOWN_PROBE__.causality()%c     - causal chain per ad session\n" +
     "  %c__YT_AD_COOLDOWN_PROBE__.gaps()%c          - delta between ad-end and next ad request\n" +
-    "  %c__YT_AD_COOLDOWN_PROBE__.opportunities()%c - youtubei requests (hadAdData=false = cooldown)\n" +
+    "  %c__YT_AD_COOLDOWN_PROBE__.opportunities()%c - player/get_watch/next rows (strong/weak ad data)\n" +
     "  %c__YT_AD_COOLDOWN_PROBE__.videoCooldown()%c  - per-video cooldown state\n" +
     "  %c__YT_AD_COOLDOWN_PROBE__.mark('label')%c   - manual phase marker\n" +
-    "  %c__YT_AD_COOLDOWN_PROBE__.adRows()%c        - ad-relevant network rows\n" +
+    "  %c__YT_AD_COOLDOWN_PROBE__.strongAdRows()%c  - only rows with strong ad data\n" +
     "  %c__YT_AD_COOLDOWN_PROBE__.adSummary()%c     - summarized ad API calls\n" +
     "  %c__YT_AD_COOLDOWN_PROBE__.copyFullDump()%c  - full dump to clipboard",
     "font-weight:bold;color:#00cc66",
