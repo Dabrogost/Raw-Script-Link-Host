@@ -1,4 +1,4 @@
-// yt-ad-cooldown-probe.js  v4
+// yt-ad-cooldown-probe.js  v4.1.2
 // Comprehensive browser telemetry probe for YouTube ad cooldown / frequency cap research.
 //
 // Monitors:
@@ -77,7 +77,7 @@
 
     // Player state polling (ms, 0 to disable)
     playerPollMs: 500,
-    playerPollMaxSnapshots: 1200, // 10 minutes at the default 500ms poll
+    playerPollMaxSnapshots: 7200, // 1 hour at the default 500ms poll
 
     // DOM mutation watching for ad containers
     watchAdContainers: true,
@@ -670,6 +670,22 @@
   // Player state monitoring
   // ---------------------------------------------------------------------------
 
+  function isActiveAdStateValue(adState) {
+    if (adState === true) return true;
+    if (typeof adState === "number") {
+      // Treat playing/paused as visible ad states; do not treat unstarted,
+      // ended, buffering/loading, or cued states as active by themselves.
+      return adState === 1 || adState === 2;
+    }
+    if (typeof adState === "string") {
+      return /^(?:active|playing|paused|ad-playing|ad-showing)$/i.test(adState);
+    }
+    if (adState && typeof adState === "object") {
+      return !!(adState.isAdPlaying || adState.adPlaying || adState.adShowing);
+    }
+    return false;
+  }
+
   function detectAdState() {
     const state = {
       isAdPlaying: false,
@@ -679,6 +695,8 @@
       adSkipButtonVisible: false,
       skipButtonText: "",
       playerAdClass: "",
+      playerAdActiveClass: "",
+      playerAdPrepClass: "",
       ytAdBadge: false,
       signals: [],   // which signals indicate ad state
     };
@@ -691,23 +709,47 @@
         );
         if (adClasses.length) {
           state.playerAdClass = adClasses.join(" ");
+          const activeAdClasses = adClasses.filter(c => /^(?:ad-showing|ad-interrupting|ad-playing)$/i.test(c));
+          const prepAdClasses = adClasses.filter(c => /^(?:ad-created|ad-loading)$/i.test(c));
+          state.playerAdActiveClass = activeAdClasses.join(" ");
+          state.playerAdPrepClass = prepAdClasses.join(" ");
+          if (prepAdClasses.length) {
+            state.signals.push("player-prep-class:" + prepAdClasses[0]);
+          }
+          if (activeAdClasses.length) {
+            state.isAdPlaying = true;
+            state.signals.push("player-active-class:" + activeAdClasses[0]);
+          }
+        }
+
+        const skipButton = player.querySelector(
+          ".ytp-ad-skip-button, .ytp-ad-skip-button-modern, " +
+          ".ytp-skip-ad-button, .videoAdUiSkipButton"
+        );
+        if (skipButton) {
+          state.adSkipButtonVisible = true;
+          state.skipButtonText = (skipButton.textContent || "").trim();
           state.isAdPlaying = true;
-          state.signals.push("player-class:" + adClasses[0]);
+          state.signals.push("skip-button");
         }
 
         if (typeof player.getAdState === "function") {
           try {
             const adState = player.getAdState();
             if (adState !== undefined && adState !== -1) {
-              state.isAdPlaying = true;
               state.adStateRaw = adState;
-              state.signals.push("getAdState");
+              if (isActiveAdStateValue(adState)) {
+                state.isAdPlaying = true;
+                state.signals.push("getAdState:active");
+              } else {
+                state.signals.push("getAdState:passive");
+              }
             }
           } catch {}
         }
 
         const adAttr = player.getAttribute("data-ad-playing") || player.getAttribute("ad-interrupting");
-        if (adAttr) {
+        if (adAttr && !/^(?:false|0|off|no)$/i.test(String(adAttr))) {
           state.isAdPlaying = true;
           state.adAttrValue = adAttr;
           state.signals.push("data-attr");
@@ -719,6 +761,7 @@
       if (adBadge) {
         state.ytAdBadge = true;
         state.adBadgeText = (adBadge.textContent || "").trim();
+        state.isAdPlaying = true;
         state.signals.push("ad-badge");
       }
 
@@ -730,7 +773,10 @@
       if (skipButton) {
         state.adSkipButtonVisible = true;
         state.skipButtonText = (skipButton.textContent || "").trim();
-        state.signals.push("skip-button");
+        if (!state.signals.includes("skip-button")) {
+          state.signals.push("skip-button");
+        }
+        state.isAdPlaying = true;
       }
 
       // Overlay ads
@@ -740,6 +786,7 @@
       );
       if (overlay) {
         state.adOverlayVisible = true;
+        state.isAdPlaying = true;
         state.signals.push("ad-overlay");
       }
 
@@ -756,9 +803,13 @@
         try {
           const adState = g.yt.player.getAdState();
           if (adState !== undefined && adState !== -1) {
-            state.isAdPlaying = true;
             state.ytApiAdState = adState;
-            state.signals.push("yt-api-getAdState");
+            if (isActiveAdStateValue(adState)) {
+              state.isAdPlaying = true;
+              state.signals.push("yt-api-getAdState:active");
+            } else {
+              state.signals.push("yt-api-getAdState:passive");
+            }
           }
         } catch {}
       }
@@ -963,11 +1014,15 @@
     const serviceIntegrity = summarizeServiceIntegrity(requestBodyJson);
     const playbackContext = summarizePlaybackContext(requestBodyJson);
 
-    const videoId =
+    const requestVideoId =
       requestBodyJson?.videoId ||
       requestBodyJson?.playerRequest?.videoId ||
       requestBodyJson?.watchNextRequest?.videoId ||
       "";
+    const videoId = requestVideoId || (
+      /\/youtubei\/v1\/player\/ad_break\b/.test(String(url || "")) ? getCurrentVideoId() : ""
+    );
+    const pageVideoId = getCurrentVideoId();
 
     const row = {
       time: new Date().toLocaleTimeString(),
@@ -985,6 +1040,7 @@
       responseStatus,
       responseCloned: !!responseCloned,
       videoId,
+      pageVideoId,
       isMedia,
 
       // Recursive ad finder output
@@ -1063,7 +1119,9 @@
 
   function remember(event) {
     event.time = new Date().toLocaleTimeString();
-    event.ms = event.ms ?? Math.round(performance.now());
+    event.ms = typeof event.ms === "number"
+      ? Math.round(event.ms)
+      : Math.round(performance.now());
     event.videoId = event.videoId || getCurrentVideoId();
     event.pageUrl = location.href;
 
@@ -1936,6 +1994,7 @@
           type: "ad-interrupted",
           time: evt.time,
           ms: evt.ms,
+          videoId: evt.toVideoId,
           fromVideoId: evt.fromVideoId,
           toVideoId: evt.toVideoId,
           durationSeconds: evt.durationSeconds,
@@ -1976,6 +2035,7 @@
     const navEvents = events.filter(e => e.event === "navigation");
     const sameVideo = [];
     const crossNavigation = [];
+    const navigationTransitions = [];
 
     for (const adEnd of adEndEvents) {
       const gapVideoId = adEnd.videoId;
@@ -2047,7 +2107,51 @@
       }
     }
 
-    return { sameVideo, crossNavigation };
+    for (const nav of navEvents) {
+      if (!nav.previousVideoId || nav.previousVideoId === nav.newVideoId) continue;
+
+      const previousAdEnd = adEndEvents
+        .filter(e => e.ms < nav.ms && e.videoId === nav.previousVideoId)
+        .sort((a, b) => b.ms - a.ms)[0];
+
+      if (!previousAdEnd) continue;
+
+      const postNavYoutubei = networkRows
+        .filter(r =>
+          rowEventMs(r) > nav.ms &&
+          r.categories.includes("youtubei") &&
+          ["player", "get_watch", "next"].some(x => r.subCategories.includes(x))
+        )
+        .sort((a, b) => rowEventMs(a) - rowEventMs(b));
+
+      const firstPostNav = postNavYoutubei[0] || null;
+
+      navigationTransitions.push({
+        fromVideoId: nav.previousVideoId,
+        toVideoId: nav.newVideoId,
+        navigationMs: nav.ms,
+        lastAdId: previousAdEnd.adId,
+        lastAdEndMs: previousAdEnd.ms,
+        lastAdDurationSeconds: previousAdEnd.durationSeconds,
+        secondsSinceLastAdEndAtNavigation: parseFloat(((nav.ms - previousAdEnd.ms) / 1000).toFixed(1)),
+        firstYoutubeiAfterNavDeltaSeconds: firstPostNav
+          ? parseFloat(((rowEventMs(firstPostNav) - nav.ms) / 1000).toFixed(1))
+          : null,
+        firstYoutubeiEndpoint: firstPostNav?.subCategories?.join(",") || null,
+        firstYoutubeiVideoId: firstPostNav?.videoId || "",
+        firstYoutubeiPageVideoId: firstPostNav?.pageVideoId || "",
+        firstYoutubeiHadStrongAdData: firstPostNav
+          ? !!(firstPostNav.adFindings?.hasAnyStrong)
+          : null,
+        firstYoutubeiHadWeakAdContext: firstPostNav
+          ? !!(firstPostNav.adFindings?.hasAnyWeak)
+          : null,
+        postNavStrongAdCount: postNavYoutubei.filter(r => r.adFindings?.hasAnyStrong).length,
+        postNavNoAdCount: postNavYoutubei.filter(r => !r.adFindings || !r.adFindings.hasAnyStrong).length,
+      });
+    }
+
+    return { sameVideo, crossNavigation, navigationTransitions };
   }
 
   // ---------------------------------------------------------------------------
@@ -2066,6 +2170,7 @@
         loggedMs: r.ms,
         eventMs: rowEventMs(r),
         videoId: r.videoId,
+        pageVideoId: r.pageVideoId,
         endpoint: r.subCategories.join(","),
         hadStrongAdData: !!(r.adFindings && r.adFindings.hasAnyStrong),
         hadWeakAdContext: !!(r.adFindings && r.adFindings.hasAnyWeak),
@@ -2153,6 +2258,7 @@
   function getActiveAdSessionSummary() {
     const now = performance.now();
     const isAdActive = !!currentAdId;
+    const timeline = cloneJson(adTimeline);
     return {
       isAdActive,
       currentAdId,
@@ -2162,7 +2268,8 @@
       activeDurationSeconds: isAdActive && adImpressionStartTime
         ? parseFloat(((now - adImpressionStartTime) / 1000).toFixed(1))
         : 0,
-      currentAdTimeline: cloneJson(adTimeline),
+      currentAdTimeline: isAdActive ? timeline : [],
+      lastAdTimeline: timeline,
       currentPlayerState: detectAdState(),
     };
   }
@@ -2198,7 +2305,7 @@
     return {
       meta: {
         probe: "yt-ad-cooldown-probe",
-        version: "v4",
+        version: "v4.1.2",
         reason,
         generatedAt: new Date().toISOString(),
         sessionId: automationState.sessionId,
@@ -2217,6 +2324,7 @@
           subCategories: r.subCategories, adFindings: r.adFindings,
           clientContext: r.clientContext, serviceIntegrity: r.serviceIntegrity,
           playbackContext: r.playbackContext, videoId: r.videoId,
+          pageVideoId: r.pageVideoId,
           responseStatus: r.responseStatus, requestStartMs: r.requestStartMs,
           responseEndMs: r.responseEndMs, requestBodyType: r.requestBodyType,
           requestBodyLength: r.requestBodyLength,
@@ -2459,134 +2567,178 @@
     host.style.pointerEvents = "auto";
 
     const shadow = host.attachShadow({ mode: "open" });
-    shadow.innerHTML = `
-      <style>
-        .panel {
-          width: 292px;
-          border: 1px solid rgba(255,255,255,.18);
-          border-radius: 8px;
-          background: rgba(18, 22, 28, .94);
-          box-shadow: 0 12px 30px rgba(0,0,0,.35);
-          overflow: hidden;
-          backdrop-filter: blur(8px);
-        }
-        .top {
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          gap: 8px;
-          padding: 8px 9px;
-          border-bottom: 1px solid rgba(255,255,255,.12);
-        }
-        .title {
-          font-weight: 700;
-          color: #e5f7ff;
-        }
-        .body {
-          padding: 8px 9px 9px;
-        }
-        .grid {
-          display: grid;
-          grid-template-columns: repeat(4, minmax(0, 1fr));
-          gap: 6px;
-          margin-bottom: 8px;
-        }
-        .metric {
-          min-width: 0;
-          border: 1px solid rgba(255,255,255,.12);
-          border-radius: 6px;
-          padding: 5px 6px;
-          background: rgba(255,255,255,.05);
-        }
-        .metric span {
-          display: block;
-          color: #93c5fd;
-          font-size: 10px;
-          text-transform: uppercase;
-        }
-        .metric strong {
-          display: block;
-          overflow: hidden;
-          text-overflow: ellipsis;
-          white-space: nowrap;
-        }
-        .line {
-          overflow: hidden;
-          text-overflow: ellipsis;
-          white-space: nowrap;
-          color: #d1d5db;
-          margin: 4px 0;
-        }
-        .actions {
-          display: grid;
-          grid-template-columns: repeat(4, 1fr);
-          gap: 6px;
-          margin-top: 8px;
-        }
-        button {
-          border: 1px solid rgba(255,255,255,.16);
-          border-radius: 6px;
-          color: #f8fafc;
-          background: rgba(255,255,255,.08);
-          padding: 5px 6px;
-          font: inherit;
-          cursor: pointer;
-        }
-        button:hover {
-          background: rgba(255,255,255,.16);
-        }
-        .primary {
-          background: #0f766e;
-          border-color: #14b8a6;
-        }
-        .primary:hover {
-          background: #0d9488;
-        }
-        .collapsed {
-          width: auto;
-        }
-        .collapsed .body {
-          display: none;
-        }
-        .collapsed .top {
-          border-bottom: 0;
-        }
-      </style>
-      <div class="panel">
-        <div class="top">
-          <div class="title">YT ad probe</div>
-          <button data-action="toggle" title="Alt+Shift+H">Hide</button>
-        </div>
-        <div class="body">
-          <div class="grid">
-            <div class="metric"><span>State</span><strong data-field="status">watching</strong></div>
-            <div class="metric"><span>Rows</span><strong data-field="rows">0</strong></div>
-            <div class="metric"><span>Ads</span><strong data-field="ads">0</strong></div>
-            <div class="metric"><span>Strong</span><strong data-field="strong">0</strong></div>
-          </div>
-          <div class="line">video: <span data-field="video">none</span></div>
-          <div class="line">events: <span data-field="events">0</span> | checkpoints: <span data-field="checkpoints">0</span></div>
-          <div class="line">last checkpoint: <span data-field="lastCheckpoint">none</span></div>
-          <div class="line">last action: <span data-field="lastAction">idle</span></div>
-          <div class="actions">
-            <button class="primary" data-action="download" title="Alt+Shift+D">Dump</button>
-            <button data-action="copy" title="Alt+Shift+C">Copy</button>
-            <button data-action="mark" title="Alt+Shift+M">Mark</button>
-            <button data-action="clear">Clear</button>
-          </div>
-        </div>
-      </div>
+    const style = document.createElement("style");
+    style.textContent = `
+      .panel {
+        width: 292px;
+        border: 1px solid rgba(255,255,255,.18);
+        border-radius: 8px;
+        background: rgba(18, 22, 28, .94);
+        box-shadow: 0 12px 30px rgba(0,0,0,.35);
+        overflow: hidden;
+        backdrop-filter: blur(8px);
+      }
+      .top {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 8px 9px;
+        border-bottom: 1px solid rgba(255,255,255,.12);
+      }
+      .title {
+        font-weight: 700;
+        color: #e5f7ff;
+      }
+      .body {
+        padding: 8px 9px 9px;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 6px;
+        margin-bottom: 8px;
+      }
+      .metric {
+        min-width: 0;
+        border: 1px solid rgba(255,255,255,.12);
+        border-radius: 6px;
+        padding: 5px 6px;
+        background: rgba(255,255,255,.05);
+      }
+      .metric span {
+        display: block;
+        color: #93c5fd;
+        font-size: 10px;
+        text-transform: uppercase;
+      }
+      .metric strong {
+        display: block;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .line {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: #d1d5db;
+        margin: 4px 0;
+      }
+      .actions {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 6px;
+        margin-top: 8px;
+      }
+      button {
+        border: 1px solid rgba(255,255,255,.16);
+        border-radius: 6px;
+        color: #f8fafc;
+        background: rgba(255,255,255,.08);
+        padding: 5px 6px;
+        font: inherit;
+        cursor: pointer;
+      }
+      button:hover {
+        background: rgba(255,255,255,.16);
+      }
+      .primary {
+        background: #0f766e;
+        border-color: #14b8a6;
+      }
+      .primary:hover {
+        background: #0d9488;
+      }
+      .collapsed {
+        width: auto;
+      }
+      .collapsed .body {
+        display: none;
+      }
+      .collapsed .top {
+        border-bottom: 0;
+      }
     `;
 
-    shadow.querySelector("[data-action='download']").addEventListener("click", () => downloadDumpFile("hud"));
-    shadow.querySelector("[data-action='copy']").addEventListener("click", () => copyDumpToClipboard("hud"));
-    shadow.querySelector("[data-action='mark']").addEventListener("click", () => promptForAutomationMarker());
-    shadow.querySelector("[data-action='clear']").addEventListener("click", () => {
+    function makeNode(tag, className, text) {
+      const node = document.createElement(tag);
+      if (className) node.className = className;
+      if (text !== undefined) node.textContent = text;
+      return node;
+    }
+
+    function makeField(tag, fieldName, text) {
+      const node = makeNode(tag, "", text);
+      node.dataset.field = fieldName;
+      return node;
+    }
+
+    function makeButton(action, text, title, className = "") {
+      const node = makeNode("button", className, text);
+      node.dataset.action = action;
+      if (title) node.title = title;
+      return node;
+    }
+
+    function makeMetric(label, fieldName, value) {
+      const metric = makeNode("div", "metric");
+      metric.append(makeNode("span", "", label), makeField("strong", fieldName, value));
+      return metric;
+    }
+
+    const panel = makeNode("div", "panel");
+    const top = makeNode("div", "top");
+    const title = makeNode("div", "title", "YT ad probe");
+    const toggleButton = makeButton("toggle", "Hide", "Alt+Shift+H");
+    top.append(title, toggleButton);
+
+    const body = makeNode("div", "body");
+    const grid = makeNode("div", "grid");
+    grid.append(
+      makeMetric("State", "status", "watching"),
+      makeMetric("Rows", "rows", "0"),
+      makeMetric("Ads", "ads", "0"),
+      makeMetric("Strong", "strong", "0")
+    );
+
+    const videoLine = makeNode("div", "line");
+    videoLine.append(document.createTextNode("video: "), makeField("span", "video", "none"));
+
+    const eventsLine = makeNode("div", "line");
+    eventsLine.append(
+      document.createTextNode("events: "),
+      makeField("span", "events", "0"),
+      document.createTextNode(" | checkpoints: "),
+      makeField("span", "checkpoints", "0")
+    );
+
+    const checkpointLine = makeNode("div", "line");
+    checkpointLine.append(document.createTextNode("last checkpoint: "), makeField("span", "lastCheckpoint", "none"));
+
+    const actionLine = makeNode("div", "line");
+    actionLine.append(document.createTextNode("last action: "), makeField("span", "lastAction", "idle"));
+
+    const actions = makeNode("div", "actions");
+    const downloadButton = makeButton("download", "Dump", "Alt+Shift+D", "primary");
+    const copyButton = makeButton("copy", "Copy", "Alt+Shift+C");
+    const markButton = makeButton("mark", "Mark", "Alt+Shift+M");
+    const clearButton = makeButton("clear", "Clear");
+    actions.append(downloadButton, copyButton, markButton, clearButton);
+
+    body.append(grid, videoLine, eventsLine, checkpointLine, actionLine, actions);
+    panel.append(top, body);
+    shadow.append(style, panel);
+
+    downloadButton.addEventListener("click", () => downloadDumpFile("hud"));
+    copyButton.addEventListener("click", () => copyDumpToClipboard("hud"));
+    markButton.addEventListener("click", () => promptForAutomationMarker());
+    clearButton.addEventListener("click", () => {
       if (confirm("[yt-ad-probe] Clear captured data?")) {
         g.__YT_AD_COOLDOWN_PROBE__?.clear();
       }
     });
-    shadow.querySelector("[data-action='toggle']").addEventListener("click", () => toggleAutomationHud());
+    toggleButton.addEventListener("click", () => toggleAutomationHud());
 
     document.documentElement.appendChild(host);
     automationState.hudRoot = host;
@@ -2736,7 +2888,7 @@
         })));
       }
       if (g.crossNavigation.length) {
-        console.log("%c[yt-ad-probe] cross-navigation gaps", "font-weight:bold;color:#ffcc00");
+        console.log("%c[yt-ad-probe] cross-navigation gaps (legacy per-ad rows)", "font-weight:bold;color:#ffcc00");
         console.table(g.crossNavigation.map(r => ({
           fromVideoId: r.fromVideoId,
           toVideoId: r.toVideoId,
@@ -2745,6 +2897,18 @@
           nextYoutubeiDeltaS: r.nextYoutubeiDeltaSeconds,
           hadStrongAd: r.nextYoutubeiHadStrongAdData,
           hadWeakCtx: r.nextYoutubeiHadWeakAdContext,
+        })));
+      }
+      if (g.navigationTransitions?.length) {
+        console.log("%c[yt-ad-probe] navigation transitions (latest ad before each nav)", "font-weight:bold;color:#93c5fd");
+        console.table(g.navigationTransitions.map(r => ({
+          fromVideoId: r.fromVideoId,
+          toVideoId: r.toVideoId,
+          secondsSinceLastAdEnd: r.secondsSinceLastAdEndAtNavigation,
+          firstYoutubeiAfterNavDeltaS: r.firstYoutubeiAfterNavDeltaSeconds,
+          firstEndpoint: r.firstYoutubeiEndpoint,
+          hadStrongAd: r.firstYoutubeiHadStrongAdData,
+          hadWeakCtx: r.firstYoutubeiHadWeakAdContext,
         })));
       }
       return g;
@@ -2778,6 +2942,7 @@
         time: r.time,
         endpoint: r.endpoint,
         videoId: r.videoId,
+        pageVideoId: r.pageVideoId,
         eventMs: r.eventMs,
         strong: r.hadStrongAdData,
         weak: r.hadWeakAdContext,
@@ -3051,7 +3216,7 @@
   });
 
   console.log(
-    "%c[yt-ad-probe] v4 installed. Hands-off recorder is running.\n" +
+    "%c[yt-ad-probe] v4.1.2 installed. Hands-off recorder is running.\n" +
     "  HUD: Dump / Copy / Mark / Clear buttons on the page\n" +
     "  Hotkeys: Alt+Shift+D dump, Alt+Shift+C copy, Alt+Shift+M mark, Alt+Shift+S checkpoint, Alt+Shift+H hide\n" +
     "  Console still works: __YT_AD_COOLDOWN_PROBE__.downloadFullDump(), .copyFullDump(), .stats(), .timeline(), .gaps()",
