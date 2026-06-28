@@ -1,4 +1,4 @@
-// yt-ad-cooldown-probe.js  v3
+// yt-ad-cooldown-probe.js  v4
 // Comprehensive browser telemetry probe for YouTube ad cooldown / frequency cap research.
 //
 // Monitors:
@@ -77,7 +77,7 @@
 
     // Player state polling (ms, 0 to disable)
     playerPollMs: 500,
-    playerPollMaxSnapshots: 200,
+    playerPollMaxSnapshots: 1200, // 10 minutes at the default 500ms poll
 
     // DOM mutation watching for ad containers
     watchAdContainers: true,
@@ -88,6 +88,18 @@
     // Debounce
     cookieDebounceMs: 250,
     storageDebounceMs: 250,
+
+    // Hands-off session recorder
+    automation: {
+      enabled: true,
+      hud: true,
+      hotkeys: true,
+      autoCheckpoints: true,
+      autoCheckpointDelayMs: 2500,
+      maxCheckpoints: 80,
+      downloadPrefix: "yt-ad-cooldown-probe",
+      includeRelevantBodyJsonInDumps: true,
+    },
   };
 
   // ---------------------------------------------------------------------------
@@ -109,6 +121,20 @@
   let currentAdId = "";
   let adTimeline = [];
   let currentVideoId = "";
+  const automationCheckpoints = [];
+  const automationState = {
+    sessionId: makeSessionId(),
+    pendingCheckpointTimer: null,
+    pendingCheckpointReasons: [],
+    hudRoot: null,
+    hudShadow: null,
+    hudStatusTimer: null,
+    hudUpdateTimer: null,
+    hotkeysInstalled: false,
+    visible: true,
+    lastAction: "installed",
+    lastCheckpoint: null,
+  };
 
   // Track the last ad-end time per videoId for delta calculation
   const lastAdEndByVideoId = {};
@@ -546,7 +572,7 @@
     };
 
     storageEvents.push({ type: "snapshot", ...snapshot });
-    while (storageEvents.length > 80) storageEvents.shift();
+    while (storageEvents.length > 500) storageEvents.shift();
   }
 
   function readStorageKeys(storage, maxLen) {
@@ -987,6 +1013,7 @@
     while (networkRows.length > maxNetworkRows) {
       networkRows.shift();
     }
+    updateAutomationHudSoon();
 
     // Log events for strong ad-relevant requests only (weak context like adSignalsInfo
     // is recorded on the row but does not trigger ad session timeline entries).
@@ -1044,6 +1071,9 @@
     while (events.length > config.maxEvents) {
       events.shift();
     }
+    try {
+      handleAutomationEvent(event);
+    } catch {}
   }
 
   // ---------------------------------------------------------------------------
@@ -1561,6 +1591,31 @@
       if (currentAdId) {
         const endMs = performance.now();
         const durationS = parseFloat(((endMs - adImpressionStartTime) / 1000).toFixed(1));
+        const adState = detectAdState();
+
+        if (adState.isAdPlaying) {
+          adTimeline.push({
+            phase: "ad-navigation-while-active",
+            time: new Date().toLocaleTimeString(),
+            ms: Math.round(endMs),
+            fromVideoId: previousVideoId,
+            toVideoId: newVideoId,
+            durationSeconds: durationS,
+            signals: adState.signals || [],
+          });
+
+          remember({
+            event: "ad-navigation-while-active",
+            adId: currentAdId,
+            fromVideoId: previousVideoId,
+            toVideoId: newVideoId,
+            durationSeconds: durationS,
+            adState,
+            timeline: cloneJson(adTimeline),
+          });
+
+          return;
+        }
 
         adTimeline.push({
           phase: "ad-interrupted-by-navigation",
@@ -1746,15 +1801,24 @@
 
     // Add ad-api-response events that fall within each session window
     for (const evt of events) {
-      if (evt.event !== "ad-api-request") continue;
+      if (evt.event !== "ad-api-request" && evt.event !== "ad-navigation-while-active") continue;
       for (const sess of sessions) {
         if (evt.ms >= sess.startMs && (sess.endMs === null || evt.ms <= sess.endMs)) {
-          sess.steps.push({
-            phase: "ad-api-response",
-            ms: evt.ms,
-            endpoint: evt.subCategories?.join(",") || "",
-            adKeys: evt.adFindings?.distinctKeys || [],
-          });
+          if (evt.event === "ad-api-request") {
+            sess.steps.push({
+              phase: "ad-api-response",
+              ms: evt.ms,
+              endpoint: evt.subCategories?.join(",") || "",
+              adKeys: evt.adFindings?.distinctKeys || [],
+            });
+          } else {
+            sess.steps.push({
+              phase: "navigation-while-active",
+              ms: evt.ms,
+              fromVideoId: evt.fromVideoId,
+              toVideoId: evt.toVideoId,
+            });
+          }
         }
       }
     }
@@ -1870,6 +1934,16 @@
       if (evt.event === "ad-interrupted-by-navigation") {
         timeline.push({
           type: "ad-interrupted",
+          time: evt.time,
+          ms: evt.ms,
+          fromVideoId: evt.fromVideoId,
+          toVideoId: evt.toVideoId,
+          durationSeconds: evt.durationSeconds,
+        });
+      }
+      if (evt.event === "ad-navigation-while-active") {
+        timeline.push({
+          type: "ad-navigation-active",
           time: evt.time,
           ms: evt.ms,
           fromVideoId: evt.fromVideoId,
@@ -2051,6 +2125,535 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Automation / one-click dump helpers
+  // ---------------------------------------------------------------------------
+
+  function makeSessionId() {
+    return new Date().toISOString().replace(/[:.]/g, "-");
+  }
+
+  function safeFilenamePart(value) {
+    return String(value || "manual")
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 40) || "manual";
+  }
+
+  function makeDumpFilename(reason) {
+    const prefix = config.automation.downloadPrefix || "yt-ad-cooldown-probe";
+    return [
+      prefix,
+      automationState.sessionId,
+      safeFilenamePart(reason),
+      safeFilenamePart(getCurrentVideoId() || "no-video"),
+    ].join("_") + ".json";
+  }
+
+  function getActiveAdSessionSummary() {
+    const now = performance.now();
+    const isAdActive = !!currentAdId;
+    return {
+      isAdActive,
+      currentAdId,
+      currentVideoId: getCurrentVideoId(),
+      pageUrl: location.href,
+      adImpressionStartMs: adImpressionStartTime ? Math.round(adImpressionStartTime) : null,
+      activeDurationSeconds: isAdActive && adImpressionStartTime
+        ? parseFloat(((now - adImpressionStartTime) / 1000).toFixed(1))
+        : 0,
+      currentAdTimeline: cloneJson(adTimeline),
+      currentPlayerState: detectAdState(),
+    };
+  }
+
+  function refreshDumpContext(reason) {
+    const label = "dump:" + reason;
+    snapshotPlayerState(label);
+    if (config.cookieSnapshots) snapshotCookies(label, location.href);
+    snapshotStorage(label);
+  }
+
+  function isAdOpportunityRow(row) {
+    return !!(
+      row &&
+      Array.isArray(row.categories) &&
+      Array.isArray(row.subCategories) &&
+      row.categories.includes("youtubei") &&
+      ["player", "get_watch", "next"].some(x => row.subCategories.includes(x))
+    );
+  }
+
+  function shouldIncludeBodyJsonInDump(row) {
+    if (!config.automation.includeRelevantBodyJsonInDumps || !row || row.isMedia) return false;
+    return !!(
+      row.adFindings ||
+      isAdOpportunityRow(row) ||
+      row.primaryCategory === "ad"
+    );
+  }
+
+  function createFullDump(reason = "manual") {
+    const stats = getStats();
+    return {
+      meta: {
+        probe: "yt-ad-cooldown-probe",
+        version: "v4",
+        reason,
+        generatedAt: new Date().toISOString(),
+        sessionId: automationState.sessionId,
+        pageUrl: location.href,
+        checkpointCount: automationCheckpoints.length,
+      },
+      identity: stats.identity,
+      stats,
+      activeAdSession: getActiveAdSessionSummary(),
+      events: cloneJson(events),
+      networkRows: networkRows.map(r => {
+        const includeBodyJson = shouldIncludeBodyJsonInDump(r);
+        return {
+          time: r.time, type: r.type, method: r.method, url: r.url,
+          primaryCategory: r.primaryCategory, categories: r.categories,
+          subCategories: r.subCategories, adFindings: r.adFindings,
+          clientContext: r.clientContext, serviceIntegrity: r.serviceIntegrity,
+          playbackContext: r.playbackContext, videoId: r.videoId,
+          responseStatus: r.responseStatus, requestStartMs: r.requestStartMs,
+          responseEndMs: r.responseEndMs, requestBodyType: r.requestBodyType,
+          requestBodyLength: r.requestBodyLength,
+          responseHeaders: r.responseHeaders,
+          requestBodyPreview: r.requestBodyPreview,
+          responseBodyPreview: r.responseBodyPreview,
+          requestBodyJson: includeBodyJson ? r.requestBodyJson : undefined,
+          responseBodyJson: includeBodyJson ? r.responseBodyJson : undefined,
+        };
+      }),
+      resourceEntries: cloneJson(resourceEntries),
+      cookieSnapshots: cloneJson(cookieSnapshots),
+      playerStateSnapshots: cloneJson(playerStateSnapshots),
+      storageEvents: cloneJson(storageEvents),
+      timeline: buildCooldownTimeline(),
+      causality: buildCausalityChain(),
+      gaps: adGapAnalysis(),
+      opportunities: adOpportunityRows(),
+      automation: {
+        checkpoints: cloneJson(automationCheckpoints),
+        lastAction: automationState.lastAction,
+        pendingCheckpointReasons: automationState.pendingCheckpointReasons.slice(),
+      },
+    };
+  }
+
+  function copyTextToClipboard(text) {
+    try {
+      if (typeof copy === "function") {
+        copy(text);
+        return true;
+      }
+    } catch {}
+
+    try {
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+        navigator.clipboard.writeText(text).catch(() => console.log(text));
+        return true;
+      }
+    } catch {}
+
+    console.log(text);
+    return false;
+  }
+
+  function downloadJson(data, filename) {
+    const text = typeof data === "string" ? data : JSON.stringify(data, null, 2);
+    const blob = new Blob([text], { type: "application/json" });
+    const objectUrl = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = objectUrl;
+    link.download = filename;
+    link.rel = "noopener";
+    link.style.display = "none";
+    document.documentElement.appendChild(link);
+    link.click();
+    setTimeout(() => {
+      URL.revokeObjectURL(objectUrl);
+      link.remove();
+    }, 1000);
+    return text.length;
+  }
+
+  function makeAutomationCheckpoint(reason = "checkpoint") {
+    const checkpoint = {
+      id: automationState.sessionId + "-" + (automationCheckpoints.length + 1),
+      reason,
+      time: new Date().toLocaleTimeString(),
+      generatedAt: new Date().toISOString(),
+      ms: Math.round(performance.now()),
+      videoId: getCurrentVideoId(),
+      pageUrl: location.href,
+      stats: getStats(),
+      activeAdSession: getActiveAdSessionSummary(),
+      lastEvents: cloneJson(events.slice(-20)),
+      lastOpportunities: cloneJson(adOpportunityRows().slice(-20)),
+      latestGaps: adGapAnalysis(),
+      latestTimeline: cloneJson(buildCooldownTimeline().slice(-40)),
+    };
+
+    automationCheckpoints.push(checkpoint);
+    while (automationCheckpoints.length > config.automation.maxCheckpoints) {
+      automationCheckpoints.shift();
+    }
+
+    automationState.lastCheckpoint = checkpoint;
+    automationState.lastAction = "checkpoint: " + reason;
+    updateAutomationHudSoon();
+    return checkpoint;
+  }
+
+  function flushAutomationCheckpoint(reason = "manual") {
+    if (automationState.pendingCheckpointTimer) {
+      clearTimeout(automationState.pendingCheckpointTimer);
+      automationState.pendingCheckpointTimer = null;
+    }
+
+    const reasons = automationState.pendingCheckpointReasons.splice(0);
+    const combinedReason = [...new Set([...reasons, reason])].filter(Boolean).join("+") || reason;
+    return makeAutomationCheckpoint(combinedReason);
+  }
+
+  function scheduleAutomationCheckpoint(reason, delayMs = config.automation.autoCheckpointDelayMs) {
+    if (!config.automation.enabled || !config.automation.autoCheckpoints) return;
+    if (reason) automationState.pendingCheckpointReasons.push(reason);
+
+    if (automationState.pendingCheckpointTimer) {
+      clearTimeout(automationState.pendingCheckpointTimer);
+    }
+
+    automationState.pendingCheckpointTimer = setTimeout(() => {
+      automationState.pendingCheckpointTimer = null;
+      const reasons = automationState.pendingCheckpointReasons.splice(0);
+      makeAutomationCheckpoint([...new Set(reasons)].join("+") || "auto");
+    }, delayMs);
+  }
+
+  function handleAutomationEvent(event) {
+    updateAutomationHudSoon();
+    if (!event || !event.event) return;
+
+    const checkpointEvents = new Set([
+      "ad-api-request",
+      "ad-session-start",
+      "ad-session-end",
+      "ad-interrupted-by-navigation",
+      "ad-navigation-while-active",
+      "dom-ad-playing-detected",
+      "dom-ad-skip-detected",
+      "navigation",
+    ]);
+
+    if (checkpointEvents.has(event.event)) {
+      scheduleAutomationCheckpoint(event.event);
+    }
+  }
+
+  function downloadDumpFile(reason = "manual") {
+    refreshDumpContext(reason);
+    flushAutomationCheckpoint(reason);
+    const dump = createFullDump(reason);
+    const filename = makeDumpFilename(reason);
+    const bytes = downloadJson(dump, filename);
+    automationState.lastAction = "downloaded: " + filename;
+    updateAutomationHudSoon();
+    console.log("[yt-ad-probe] downloaded dump", { filename, bytes });
+    return { filename, bytes, checkpointCount: automationCheckpoints.length };
+  }
+
+  function copyDumpToClipboard(reason = "manual") {
+    refreshDumpContext(reason);
+    flushAutomationCheckpoint(reason);
+    const text = JSON.stringify(createFullDump(reason), null, 2);
+    const copied = copyTextToClipboard(text);
+    automationState.lastAction = copied ? "copied dump" : "printed dump";
+    updateAutomationHudSoon();
+    return text.length;
+  }
+
+  function addAutomationMarker(label = "manual") {
+    remember({
+      event: "manual-marker",
+      label,
+      identity: getIdentityState(),
+    });
+    snapshotPlayerState("marker:" + label);
+    snapshotCookies("marker:" + label, location.href);
+    snapshotStorage("marker:" + label);
+    makeAutomationCheckpoint("marker:" + label);
+    console.log("%c[yt-ad-probe] marker: " + label, "font-weight:bold;color:#ffcc00");
+    return getStats();
+  }
+
+  function promptForAutomationMarker() {
+    const fallback = "marker-" + new Date().toLocaleTimeString().replace(/[^0-9a-z]+/gi, "-");
+    const label = prompt("[yt-ad-probe] Marker label", fallback);
+    if (label === null) return null;
+    return addAutomationMarker(label || fallback);
+  }
+
+  function updateAutomationHudSoon() {
+    if (!automationState.hudShadow || automationState.hudUpdateTimer) return;
+    automationState.hudUpdateTimer = setTimeout(() => {
+      automationState.hudUpdateTimer = null;
+      updateAutomationHud();
+    }, 250);
+  }
+
+  function setHudText(name, value) {
+    const el = automationState.hudShadow?.querySelector("[data-field='" + name + "']");
+    if (el) el.textContent = String(value);
+  }
+
+  function updateAutomationHud() {
+    if (!automationState.hudShadow) return;
+
+    const stats = getStats();
+    const strongRows = getStrongAdRows().length;
+    const adEnds = events.filter(e => e.event === "ad-session-end").length;
+    const active = stats.isAdActive ? "ad active" : "watching";
+    const lastCheckpoint = automationState.lastCheckpoint
+      ? automationState.lastCheckpoint.time + " " + automationState.lastCheckpoint.reason
+      : "none";
+
+    setHudText("status", active);
+    setHudText("video", stats.currentVideoId || "none");
+    setHudText("rows", stats.totalNetworkRows);
+    setHudText("events", stats.totalEvents);
+    setHudText("ads", adEnds);
+    setHudText("strong", strongRows);
+    setHudText("checkpoints", automationCheckpoints.length);
+    setHudText("lastCheckpoint", lastCheckpoint);
+    setHudText("lastAction", automationState.lastAction || "idle");
+
+    const panel = automationState.hudShadow.querySelector(".panel");
+    if (panel) panel.classList.toggle("collapsed", !automationState.visible);
+
+    const toggle = automationState.hudShadow.querySelector("[data-action='toggle']");
+    if (toggle) toggle.textContent = automationState.visible ? "Hide" : "Show";
+  }
+
+  function toggleAutomationHud(forceVisible) {
+    automationState.visible = typeof forceVisible === "boolean" ? forceVisible : !automationState.visible;
+    updateAutomationHud();
+    return automationState.visible;
+  }
+
+  function startAutomationHud() {
+    if (!config.automation.enabled || !config.automation.hud || automationState.hudRoot) return;
+    if (!document.documentElement) return;
+
+    const host = document.createElement("div");
+    host.id = "yt-ad-cooldown-probe-hud";
+    host.style.position = "fixed";
+    host.style.left = "12px";
+    host.style.bottom = "12px";
+    host.style.zIndex = "2147483647";
+    host.style.font = "12px/1.35 Arial, sans-serif";
+    host.style.color = "#f8fafc";
+    host.style.pointerEvents = "auto";
+
+    const shadow = host.attachShadow({ mode: "open" });
+    shadow.innerHTML = `
+      <style>
+        .panel {
+          width: 292px;
+          border: 1px solid rgba(255,255,255,.18);
+          border-radius: 8px;
+          background: rgba(18, 22, 28, .94);
+          box-shadow: 0 12px 30px rgba(0,0,0,.35);
+          overflow: hidden;
+          backdrop-filter: blur(8px);
+        }
+        .top {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 8px;
+          padding: 8px 9px;
+          border-bottom: 1px solid rgba(255,255,255,.12);
+        }
+        .title {
+          font-weight: 700;
+          color: #e5f7ff;
+        }
+        .body {
+          padding: 8px 9px 9px;
+        }
+        .grid {
+          display: grid;
+          grid-template-columns: repeat(4, minmax(0, 1fr));
+          gap: 6px;
+          margin-bottom: 8px;
+        }
+        .metric {
+          min-width: 0;
+          border: 1px solid rgba(255,255,255,.12);
+          border-radius: 6px;
+          padding: 5px 6px;
+          background: rgba(255,255,255,.05);
+        }
+        .metric span {
+          display: block;
+          color: #93c5fd;
+          font-size: 10px;
+          text-transform: uppercase;
+        }
+        .metric strong {
+          display: block;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .line {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+          color: #d1d5db;
+          margin: 4px 0;
+        }
+        .actions {
+          display: grid;
+          grid-template-columns: repeat(4, 1fr);
+          gap: 6px;
+          margin-top: 8px;
+        }
+        button {
+          border: 1px solid rgba(255,255,255,.16);
+          border-radius: 6px;
+          color: #f8fafc;
+          background: rgba(255,255,255,.08);
+          padding: 5px 6px;
+          font: inherit;
+          cursor: pointer;
+        }
+        button:hover {
+          background: rgba(255,255,255,.16);
+        }
+        .primary {
+          background: #0f766e;
+          border-color: #14b8a6;
+        }
+        .primary:hover {
+          background: #0d9488;
+        }
+        .collapsed {
+          width: auto;
+        }
+        .collapsed .body {
+          display: none;
+        }
+        .collapsed .top {
+          border-bottom: 0;
+        }
+      </style>
+      <div class="panel">
+        <div class="top">
+          <div class="title">YT ad probe</div>
+          <button data-action="toggle" title="Alt+Shift+H">Hide</button>
+        </div>
+        <div class="body">
+          <div class="grid">
+            <div class="metric"><span>State</span><strong data-field="status">watching</strong></div>
+            <div class="metric"><span>Rows</span><strong data-field="rows">0</strong></div>
+            <div class="metric"><span>Ads</span><strong data-field="ads">0</strong></div>
+            <div class="metric"><span>Strong</span><strong data-field="strong">0</strong></div>
+          </div>
+          <div class="line">video: <span data-field="video">none</span></div>
+          <div class="line">events: <span data-field="events">0</span> | checkpoints: <span data-field="checkpoints">0</span></div>
+          <div class="line">last checkpoint: <span data-field="lastCheckpoint">none</span></div>
+          <div class="line">last action: <span data-field="lastAction">idle</span></div>
+          <div class="actions">
+            <button class="primary" data-action="download" title="Alt+Shift+D">Dump</button>
+            <button data-action="copy" title="Alt+Shift+C">Copy</button>
+            <button data-action="mark" title="Alt+Shift+M">Mark</button>
+            <button data-action="clear">Clear</button>
+          </div>
+        </div>
+      </div>
+    `;
+
+    shadow.querySelector("[data-action='download']").addEventListener("click", () => downloadDumpFile("hud"));
+    shadow.querySelector("[data-action='copy']").addEventListener("click", () => copyDumpToClipboard("hud"));
+    shadow.querySelector("[data-action='mark']").addEventListener("click", () => promptForAutomationMarker());
+    shadow.querySelector("[data-action='clear']").addEventListener("click", () => {
+      if (confirm("[yt-ad-probe] Clear captured data?")) {
+        g.__YT_AD_COOLDOWN_PROBE__?.clear();
+      }
+    });
+    shadow.querySelector("[data-action='toggle']").addEventListener("click", () => toggleAutomationHud());
+
+    document.documentElement.appendChild(host);
+    automationState.hudRoot = host;
+    automationState.hudShadow = shadow;
+    updateAutomationHud();
+    automationState.hudStatusTimer = setInterval(updateAutomationHud, 1000);
+  }
+
+  function onAutomationKeydown(event) {
+    if (!config.automation.enabled || !config.automation.hotkeys) return;
+    if (!event.altKey || !event.shiftKey || event.ctrlKey || event.metaKey) return;
+
+    const key = String(event.key || "").toLowerCase();
+    if (!["d", "c", "m", "h", "s"].includes(key)) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+
+    if (key === "d") downloadDumpFile("hotkey");
+    else if (key === "c") copyDumpToClipboard("hotkey");
+    else if (key === "m") promptForAutomationMarker();
+    else if (key === "h") toggleAutomationHud();
+    else if (key === "s") makeAutomationCheckpoint("hotkey-snapshot");
+  }
+
+  function startAutomationHotkeys() {
+    if (!config.automation.enabled || !config.automation.hotkeys || automationState.hotkeysInstalled) return;
+    document.addEventListener("keydown", onAutomationKeydown, true);
+    automationState.hotkeysInstalled = true;
+  }
+
+  function startAutomation() {
+    if (!config.automation.enabled) return;
+
+    startAutomationHotkeys();
+    if (document.body || document.documentElement) {
+      startAutomationHud();
+    } else {
+      document.addEventListener("DOMContentLoaded", startAutomationHud, { once: true });
+    }
+  }
+
+  function stopAutomation() {
+    if (automationState.pendingCheckpointTimer) {
+      clearTimeout(automationState.pendingCheckpointTimer);
+      automationState.pendingCheckpointTimer = null;
+    }
+    if (automationState.hudUpdateTimer) {
+      clearTimeout(automationState.hudUpdateTimer);
+      automationState.hudUpdateTimer = null;
+    }
+    if (automationState.hudStatusTimer) {
+      clearInterval(automationState.hudStatusTimer);
+      automationState.hudStatusTimer = null;
+    }
+    if (automationState.hotkeysInstalled) {
+      document.removeEventListener("keydown", onAutomationKeydown, true);
+      automationState.hotkeysInstalled = false;
+    }
+    if (automationState.hudRoot) {
+      automationState.hudRoot.remove();
+      automationState.hudRoot = null;
+      automationState.hudShadow = null;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Public API
   // ---------------------------------------------------------------------------
 
@@ -2063,6 +2666,7 @@
     resourceEntries,
     storageEvents,
     adTimeline,
+    automationCheckpoints,
 
     stats() {
       const s = getStats();
@@ -2260,16 +2864,7 @@
     },
 
     mark(label) {
-      remember({
-        event: "manual-marker",
-        label,
-        identity: getIdentityState(),
-      });
-      snapshotPlayerState("marker:" + label);
-      snapshotCookies("marker:" + label, location.href);
-      snapshotStorage("marker:" + label);
-      console.log("%c[yt-ad-probe] marker: " + label, "font-weight:bold;color:#ffcc00");
-      return getStats();
+      return addAutomationMarker(label);
     },
 
     probeNow(reason = "manual") {
@@ -2277,6 +2872,44 @@
       snapshotCookies(reason, location.href);
       snapshotStorage(reason);
       return getStats();
+    },
+
+    checkpoint(reason = "manual") {
+      refreshDumpContext("checkpoint:" + reason);
+      return makeAutomationCheckpoint(reason);
+    },
+
+    checkpoints() {
+      console.table(automationCheckpoints.map(c => ({
+        time: c.time,
+        reason: c.reason,
+        videoId: c.videoId,
+        rows: c.stats.totalNetworkRows,
+        events: c.stats.totalEvents,
+      })));
+      return automationCheckpoints;
+    },
+
+    getFullDump(reason = "manual") {
+      refreshDumpContext(reason);
+      return createFullDump(reason);
+    },
+
+    downloadFullDump(reason = "manual") {
+      return downloadDumpFile(reason);
+    },
+
+    showHud() {
+      startAutomationHud();
+      return toggleAutomationHud(true);
+    },
+
+    hideHud() {
+      return toggleAutomationHud(false);
+    },
+
+    toggleHud() {
+      return toggleAutomationHud();
     },
 
     // Clipboard
@@ -2340,29 +2973,7 @@
     },
 
     copyFullDump() {
-      const dump = {
-        identity: getIdentityState(),
-        stats: getStats(),
-        events,
-        networkRows: networkRows.map(r => ({
-          time: r.time, type: r.type, method: r.method, url: r.url,
-          primaryCategory: r.primaryCategory, subCategories: r.subCategories,
-          adFindings: r.adFindings, clientContext: r.clientContext,
-          videoId: r.videoId, responseStatus: r.responseStatus,
-          requestBodyPreview: r.requestBodyPreview,
-          responseBodyPreview: r.responseBodyPreview,
-        })),
-        resourceEntries,
-        cookieSnapshots,
-        playerStateSnapshots: playerStateSnapshots.slice(-50),
-        storageEvents: storageEvents.slice(-50),
-        timeline: buildCooldownTimeline(),
-        causality: buildCausalityChain(),
-        gaps: adGapAnalysis(),
-      };
-      const text = JSON.stringify(dump, null, 2);
-      try { copy(text); } catch { console.log(text); }
-      return text.length;
+      return copyDumpToClipboard("manual-copy");
     },
 
     // Management
@@ -2374,6 +2985,15 @@
       storageEvents.length = 0;
       resourceEntries.length = 0;
       adTimeline.length = 0;
+      automationCheckpoints.length = 0;
+      if (automationState.pendingCheckpointTimer) {
+        clearTimeout(automationState.pendingCheckpointTimer);
+        automationState.pendingCheckpointTimer = null;
+      }
+      automationState.pendingCheckpointReasons.length = 0;
+      automationState.lastCheckpoint = null;
+      automationState.lastAction = "cleared";
+      automationState.sessionId = makeSessionId();
       currentAdId = "";
       adImpressionStartTime = 0;
       lastCookieSnapshotTime = 0;
@@ -2381,10 +3001,12 @@
       for (const key of Object.keys(lastAdEndByVideoId)) {
         delete lastAdEndByVideoId[key];
       }
+      updateAutomationHudSoon();
       console.log("[yt-ad-probe] all state cleared");
     },
 
     stop() {
+      stopAutomation();
       stopPlayerPolling();
       stopAdContainerWatching();
       stopResourceObserver();
@@ -2420,6 +3042,7 @@
   startPlayerPolling();
   startAdContainerWatching();
   startResourceObserver();
+  startAutomation();
 
   remember({
     event: "probe-installed",
@@ -2428,28 +3051,10 @@
   });
 
   console.log(
-    "%c[yt-ad-probe] v3 installed. Research commands:\n" +
-    "  %c__YT_AD_COOLDOWN_PROBE__.stats()%c         - network & resource summary\n" +
-    "  %c__YT_AD_COOLDOWN_PROBE__.identity()%c      - browser identity snapshot\n" +
-    "  %c__YT_AD_COOLDOWN_PROBE__.timeline()%c      - cooldown event timeline\n" +
-    "  %c__YT_AD_COOLDOWN_PROBE__.causality()%c     - causal chain per ad session\n" +
-    "  %c__YT_AD_COOLDOWN_PROBE__.gaps()%c          - delta between ad-end and next ad request\n" +
-    "  %c__YT_AD_COOLDOWN_PROBE__.opportunities()%c - player/get_watch/next rows (strong/weak ad data)\n" +
-    "  %c__YT_AD_COOLDOWN_PROBE__.videoCooldown()%c  - per-video cooldown state\n" +
-    "  %c__YT_AD_COOLDOWN_PROBE__.mark('label')%c   - manual phase marker\n" +
-    "  %c__YT_AD_COOLDOWN_PROBE__.strongAdRows()%c  - only rows with strong ad data\n" +
-    "  %c__YT_AD_COOLDOWN_PROBE__.adSummary()%c     - summarized ad API calls\n" +
-    "  %c__YT_AD_COOLDOWN_PROBE__.copyFullDump()%c  - full dump to clipboard",
-    "font-weight:bold;color:#00cc66",
-    "color:#00cc66", "",
-    "color:#00cc66", "",
-    "color:#00cc66", "",
-    "color:#00cc66", "",
-    "color:#00cc66", "",
-    "color:#00cc66", "",
-    "color:#00cc66", "",
-    "color:#00cc66", "",
-    "color:#00cc66", "",
-    "color:#00cc66", ""
+    "%c[yt-ad-probe] v4 installed. Hands-off recorder is running.\n" +
+    "  HUD: Dump / Copy / Mark / Clear buttons on the page\n" +
+    "  Hotkeys: Alt+Shift+D dump, Alt+Shift+C copy, Alt+Shift+M mark, Alt+Shift+S checkpoint, Alt+Shift+H hide\n" +
+    "  Console still works: __YT_AD_COOLDOWN_PROBE__.downloadFullDump(), .copyFullDump(), .stats(), .timeline(), .gaps()",
+    "font-weight:bold;color:#00cc66"
   );
 })();
